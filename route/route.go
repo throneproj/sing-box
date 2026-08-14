@@ -383,6 +383,12 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
 				}
 				continue
 			}
+			if action.OverrideDestination && M.IsDomainName(metadata.Domain) {
+				metadata.Destination = M.Socksaddr{
+					Fqdn: metadata.Domain,
+					Port: metadata.Destination.Port,
+				}
+			}
 			if metadata.Domain != "" && metadata.Client != "" {
 				r.logger.DebugContext(ctx, "sniffed packet protocol: ", metadata.Protocol, ", domain: ", metadata.Domain, ", client: ", metadata.Client)
 			} else if metadata.Domain != "" {
@@ -767,6 +773,12 @@ func (r *Router) actionSniff(
 		metadata.SnifferNames = action.SnifferNames
 		metadata.SniffError = err
 		if err == nil {
+			if action.OverrideDestination && M.IsDomainName(metadata.Domain) {
+				metadata.Destination = M.Socksaddr{
+					Fqdn: metadata.Domain,
+					Port: metadata.Destination.Port,
+				}
+			}
 			if metadata.Domain != "" && metadata.Client != "" {
 				r.logger.DebugContext(ctx, "sniffed protocol: ", metadata.Protocol, ", domain: ", metadata.Domain, ", client: ", metadata.Client)
 			} else if metadata.Domain != "" {
@@ -883,6 +895,12 @@ func (r *Router) actionSniff(
 		}
 	finally:
 		if err == nil {
+			if action.OverrideDestination && M.IsDomainName(metadata.Domain) {
+				metadata.Destination = M.Socksaddr{
+					Fqdn: metadata.Domain,
+					Port: metadata.Destination.Port,
+				}
+			}
 			if metadata.Domain != "" && metadata.Client != "" {
 				r.logger.DebugContext(ctx, "sniffed packet protocol: ", metadata.Protocol, ", domain: ", metadata.Domain, ", client: ", metadata.Client)
 			} else if metadata.Domain != "" {
