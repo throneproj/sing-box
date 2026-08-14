@@ -380,7 +380,8 @@ func (r *NetworkManager) AutoDetectInterfaceFunc() control.Func {
 			remoteAddr := M.ParseSocksaddr(address).Addr
 			if remoteAddr.IsValid() {
 				iif, err := r.interfaceFinder.ByAddr(remoteAddr)
-				if err == nil {
+				// Binding to our own TUN feeds the packet back into the inbound that produced it, and that loop never ends.
+				if err == nil && !slices.Contains(r.interfaceMonitor.MyInterfaces(), iif.Name) {
 					return iif.Name, iif.Index, nil
 				}
 			}
