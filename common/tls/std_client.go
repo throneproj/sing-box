@@ -35,6 +35,7 @@ type STDClientConfig struct {
 	recordFragment        bool
 	spoof                 string
 	spoofMethod           tlsspoof.Method
+	mixedCaseSNI          bool
 }
 
 func (c *STDClientConfig) ServerName() string {
@@ -50,6 +51,10 @@ func (c *STDClientConfig) SetServerName(serverName string) {
 		} else {
 			c.config.VerifyConnection = nil
 		}
+		return
+	}
+	if c.mixedCaseSNI {
+		c.config.ServerName = randomizeCase(serverName)
 		return
 	}
 	c.config.ServerName = serverName
@@ -99,6 +104,7 @@ func (c *STDClientConfig) Clone() Config {
 		recordFragment:        c.recordFragment,
 		spoof:                 c.spoof,
 		spoofMethod:           c.spoofMethod,
+		mixedCaseSNI:          c.mixedCaseSNI,
 	}
 	cloned.SetServerName(cloned.serverName)
 	return cloned
@@ -244,6 +250,7 @@ func newSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddres
 		recordFragment:        options.RecordFragment,
 		spoof:                 spoof,
 		spoofMethod:           spoofMethod,
+		mixedCaseSNI:          options.TLSTricks != nil && options.TLSTricks.MixedCaseSNI,
 	}
 	config.SetServerName(serverName)
 	if options.ECH != nil && options.ECH.Enabled {
