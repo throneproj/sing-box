@@ -22,6 +22,7 @@ const (
 	TypeSSH                = "ssh"
 	TypeShadowTLS          = "shadowtls"
 	TypeAnyTLS             = "anytls"
+	TypeMieru              = "mieru"
 	TypeShadowsocksR       = "shadowsocksr"
 	TypeVLESS              = "vless"
 	TypeTUIC               = "tuic"
@@ -43,6 +44,8 @@ const (
 	TypeHysteriaRealm      = "hysteria-realm"
 	TypeACME               = "acme"
 	TypeCloudflareOriginCA = "cloudflare-origin-ca"
+	TypeJuicity            = "juicity"
+	TypeTrustTunnel        = "trusttunnel"
 )
 
 const (
@@ -109,10 +112,16 @@ func ProxyDisplayName(proxyType string) string {
 		return "OpenVPN Client"
 	case TypeOpenVPNServer:
 		return "OpenVPN Server"
+	case TypeMieru:
+		return "Mieru"
 	case TypeTailscale:
 		return "Tailscale"
 	case TypeCloudflared:
 		return "Cloudflared"
+	case TypeJuicity:
+		return "Juicity"
+	case TypeTrustTunnel:
+		return "TrustTunnel"
 	case TypeSelector:
 		return "Selector"
 	case TypeURLTest:
