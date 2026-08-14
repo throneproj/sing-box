@@ -2,6 +2,7 @@ package trafficcontrol
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -35,7 +36,9 @@ var (
 )
 
 type Manager struct {
-	outbound adapter.OutboundManager
+	outbound    adapter.OutboundManager
+	uploadMap   compatible.Map[string, *atomic.Int64]
+	downloadMap compatible.Map[string, *atomic.Int64]
 
 	connections             compatible.Map[uuid.UUID, Tracker]
 	closedConnectionsAccess sync.Mutex
@@ -136,6 +139,47 @@ func (m *Manager) Total() (uplinkTotal int64, downlinkTotal int64) {
 		downlinkTotal += metadata.Download.Load()
 		return true
 	})
+	return
+}
+
+// outboundCounters extends a connection's own counters with the per-outbound
+// accumulators sampled by TotalOutbound, so a single counted read or write
+// feeds both the connection metadata and the outbound totals.
+func (m *Manager) outboundCounters(outbound string, upload *atomic.Int64, download *atomic.Int64) ([]*atomic.Int64, []*atomic.Int64) {
+	if outbound == "" {
+		return []*atomic.Int64{upload}, []*atomic.Int64{download}
+	}
+	uploadCounter, _ := m.uploadMap.LoadOrStore(outbound, new(atomic.Int64))
+	downloadCounter, _ := m.downloadMap.LoadOrStore(outbound, new(atomic.Int64))
+	return []*atomic.Int64{upload, uploadCounter}, []*atomic.Int64{download, downloadCounter}
+}
+
+func (m *Manager) pushUploaded(outbound string, size int64) {
+	if outbound == "" {
+		return
+	}
+	counter, _ := m.uploadMap.LoadOrStore(outbound, new(atomic.Int64))
+	counter.Add(size)
+}
+
+func (m *Manager) pushDownloaded(outbound string, size int64) {
+	if outbound == "" {
+		return
+	}
+	counter, _ := m.downloadMap.LoadOrStore(outbound, new(atomic.Int64))
+	counter.Add(size)
+}
+
+// TotalOutbound reports the traffic accounted to an outbound since the last
+// call and resets its counters, so consumers sampling it periodically read a
+// per-interval delta rather than a running total.
+func (m *Manager) TotalOutbound(outbound string) (uplinkTotal int64, downlinkTotal int64) {
+	if counter, loaded := m.uploadMap.Load(outbound); loaded {
+		uplinkTotal = counter.Swap(0)
+	}
+	if counter, loaded := m.downloadMap.Load(outbound); loaded {
+		downlinkTotal = counter.Swap(0)
+	}
 	return
 }
 
