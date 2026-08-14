@@ -1,0 +1,129 @@
+package trusttunnel
+
+import (
+	"bytes"
+	"crypto/rand"
+	"encoding/hex"
+	"io"
+	"net"
+	"strings"
+	"sync/atomic"
+
+	"github.com/sagernet/sing-box/common/tls"
+	"github.com/sagernet/sing-box/option"
+	E "github.com/sagernet/sing/common/exceptions"
+)
+
+const clientRandomLength = 32
+
+// clientRandomConfig makes every new TLS or QUIC connection send a ClientHello
+// random the server accepts, as required by client_random or
+// client_random_auth_key.
+//
+// crypto/tls and uTLS take the ClientHello random from the config's entropy
+// source, so every connection gets its own reader.
+type clientRandomConfig struct {
+	tls.Config
+	newReader func() io.Reader
+}
+
+func newClientRandomConfig(config tls.Config, clientRandom string, tlsOptions option.OutboundTLSOptions) (tls.Config, error) {
+	err := checkClientRandomConfig(config, tlsOptions, "client_random")
+	if err != nil {
+		return nil, err
+	}
+	prefix, mask, err := parseClientRandom(clientRandom)
+	if err != nil {
+		return nil, err
+	}
+	return &clientRandomConfig{
+		Config: config,
+		newReader: func() io.Reader {
+			return &clientRandomReader{prefix: prefix, mask: mask}
+		},
+	}, nil
+}
+
+func checkClientRandomConfig(config tls.Config, tlsOptions option.OutboundTLSOptions, optionName string) error {
+	if tlsOptions.ECH != nil && tlsOptions.ECH.Enabled {
+		// The random of the inner ClientHello is not the one sent on the wire.
+		return E.New(optionName, " is not compatible with ECH")
+	}
+	if tlsOptions.UTLS != nil && tlsOptions.UTLS.Enabled && tlsOptions.UTLS.Fingerprint == "custom" {
+		// The padded ClientHello is rebuilt with a fresh random during the handshake.
+		return E.New(optionName, " is not compatible with the custom uTLS fingerprint")
+	}
+	if _, isRandCapable := config.(tls.RandCapableConfig); !isRandCapable {
+		return E.New(optionName, " is not compatible with REALITY or the system TLS engines")
+	}
+	return nil
+}
+
+func (c *clientRandomConfig) Client(conn net.Conn) (tls.Conn, error) {
+	return c.Config.(tls.RandCapableConfig).ClientWithRand(conn, c.newReader())
+}
+
+// STDConfig returns a fresh standard config for every caller. sing-quic calls
+// this method once per dial, so each QUIC connection gets its own reader.
+func (c *clientRandomConfig) STDConfig() (*tls.STDConfig, error) {
+	stdConfig, err := c.Config.STDConfig()
+	if err != nil {
+		return nil, err
+	}
+	stdConfig = stdConfig.Clone()
+	stdConfig.Rand = c.newReader()
+	return stdConfig, nil
+}
+
+func (c *clientRandomConfig) Clone() tls.Config {
+	return &clientRandomConfig{
+		Config:    c.Config.Clone(),
+		newReader: c.newReader,
+	}
+}
+
+// parseClientRandom parses the TrustTunnel prefix[/mask] hex syntax, an omitted
+// mask sets every bit of the prefix.
+func parseClientRandom(clientRandom string) (prefix []byte, mask []byte, err error) {
+	prefixString, maskString, hasMask := strings.Cut(clientRandom, "/")
+	prefix, err = hex.DecodeString(prefixString)
+	if err != nil {
+		return nil, nil, E.Cause(err, "decode client_random prefix")
+	}
+	if len(prefix) == 0 || len(prefix) > clientRandomLength {
+		return nil, nil, E.New("client_random prefix must be 1 to ", clientRandomLength, " bytes")
+	}
+	if !hasMask {
+		return prefix, bytes.Repeat([]byte{0xFF}, len(prefix)), nil
+	}
+	mask, err = hex.DecodeString(maskString)
+	if err != nil {
+		return nil, nil, E.Cause(err, "decode client_random mask")
+	}
+	if len(mask) != len(prefix) {
+		return nil, nil, E.New("client_random mask must be as long as the prefix")
+	}
+	return prefix, mask, nil
+}
+
+// clientRandomReader is the entropy source of a single TLS connection. The
+// ClientHello random is the first 32 byte read of a client handshake, so the
+// prefix is applied there and nowhere else.
+type clientRandomReader struct {
+	prefix  []byte
+	mask    []byte
+	applied atomic.Bool
+}
+
+func (r *clientRandomReader) Read(p []byte) (int, error) {
+	n, err := rand.Read(p)
+	if err != nil || n != clientRandomLength {
+		return n, err
+	}
+	if r.applied.CompareAndSwap(false, true) {
+		for i, prefixByte := range r.prefix {
+			p[i] = p[i]&^r.mask[i] | prefixByte&r.mask[i]
+		}
+	}
+	return n, nil
+}
