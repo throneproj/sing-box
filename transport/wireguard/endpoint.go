@@ -43,6 +43,8 @@ type Endpoint struct {
 	stateAccess    sync.Mutex
 	suspended      atomic.Bool
 	networkPaused  bool
+	// Public keys of the peers handshaking without a live session.
+	handshaking sync.Map
 }
 
 func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
@@ -58,6 +60,11 @@ func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
 	if options.ListenPort != 0 {
 		ipcConf += "\nlisten_port=" + F.ToString(options.ListenPort)
 	}
+	amneziaConf, err := options.AmneziaWG.GenerateIpcLines()
+	if err != nil {
+		return nil, err
+	}
+	ipcConf += amneziaConf
 	var peers []peerConfig
 	for peerIndex, rawPeer := range options.Peers {
 		peer := peerConfig{
@@ -192,6 +199,9 @@ func (e *Endpoint) Start(postStart bool) error {
 			reserved = e.peers[0].reserved
 			if e.peers[0].endpoint.IsValid() {
 				destination = M.SocksaddrFromNetIP(e.peers[0].endpoint)
+			} else if e.peers[0].destination.IsDomain() {
+				// The bind dials a domain peer, so its detour resolves the name per connect.
+				destination = e.peers[0].destination
 			}
 		}
 		bind = NewClientBind(e.options.Context, e.options.Logger, e.options.Dialer, destination, reserved)
@@ -216,13 +226,26 @@ func (e *Endpoint) Start(postStart bool) error {
 		},
 	}
 	wgDevice := device.NewDevice(e.options.Context, e.returnDevice, bind, logger, e.options.Workers)
+	clientBind, isClientBind := bind.(*ClientBind)
+	if isClientBind {
+		wgDevice.SetSessionStateFunc(e.noteSessionState)
+		clientBind.SetRedialHandler(e.handshakeOnRedial)
+	}
 	domainPeers := make(map[device.NoisePublicKey]*peerConfig)
 	for peerIndex, peer := range e.peers {
 		if peer.destination.IsDomain() {
 			domainPeers[peer.publicKey] = &e.peers[peerIndex]
 		}
 	}
-	if len(domainPeers) > 0 {
+	// A connected bind dials the domain and its detour resolves it: addresses resolved here would only send each
+	// initiation once per address down that one flow, after a lookup on the sending goroutine.
+	connectedDomain := isClientBind && clientBind.isConnect && len(domainPeers) > 0
+	if connectedDomain {
+		endpoint := clientBind.connectEndpoint()
+		wgDevice.SetEndpointResolverFunc(func(device.NoisePublicKey) ([]conn.Endpoint, error) {
+			return []conn.Endpoint{endpoint}, nil
+		})
+	} else if len(domainPeers) > 0 {
 		wgDevice.SetEndpointResolverFunc(func(publicKey device.NoisePublicKey) ([]conn.Endpoint, error) {
 			peer, found := domainPeers[publicKey]
 			if !found {
@@ -263,6 +286,10 @@ func (e *Endpoint) Start(postStart bool) error {
 		if loaded {
 			wgPeers = append(wgPeers, wgPeer)
 		}
+	}
+	if connectedDomain && len(wgPeers) == 1 {
+		// wireguard-go clears only a current endpoint, so until the first reply a dead flow would never be replaced.
+		wgPeers[0].SetEndpointFromPacket(clientBind.connectEndpoint())
 	}
 	e.tunDevice.SetDevice(wgDevice, wgPeers)
 	e.device.Store(wgDevice)
@@ -368,6 +395,33 @@ func (e *Endpoint) BindUpdate() error {
 	return wgDevice.BindUpdate()
 }
 
+func (e *Endpoint) noteSessionState(publicKey device.NoisePublicKey, state device.PeerSessionState) {
+	if state == device.PeerSessionHandshake {
+		e.handshaking.Store(publicKey, struct{}{})
+	} else {
+		e.handshaking.Delete(publicKey)
+	}
+}
+
+// The answer to the last initiation went down with the old flow, so a new one goes out now rather than at the next
+// retry, up to 5 s later. A handshaking peer has no live keypair, so expiring them only lifts wireguard-go's limit of
+// one initiation per retry interval.
+func (e *Endpoint) handshakeOnRedial() {
+	wgDevice := e.device.Load()
+	if wgDevice == nil {
+		return
+	}
+	e.handshaking.Range(func(key, _ any) bool {
+		peer := wgDevice.LookupPeer(key.(device.NoisePublicKey))
+		if peer != nil {
+			peer.ExpireCurrentKeypairs()
+			// A retry, so that the attempts this handshake has left are not reset.
+			peer.SendHandshakeInitiation(true)
+		}
+		return true
+	})
+}
+
 func (e *Endpoint) onPauseUpdated(event int) {
 	switch event {
 	case pause.EventNetworkPause, pause.EventNetworkWake:
@@ -396,7 +450,7 @@ type peerConfig struct {
 	publicKey       device.NoisePublicKey
 	preSharedKeyHex string
 	allowedIPs      []netip.Prefix
-	keepalive       uint16
+	keepalive       string
 	reserved        [3]uint8
 }
 
@@ -412,8 +466,8 @@ func (c peerConfig) GenerateIpcLines() string {
 	for _, allowedIP := range c.allowedIPs {
 		ipcLines.WriteString("\nallowed_ip=" + allowedIP.String())
 	}
-	if c.keepalive > 0 {
-		ipcLines.WriteString("\npersistent_keepalive_interval=" + F.ToString(c.keepalive))
+	if c.keepalive != "" {
+		ipcLines.WriteString("\npersistent_keepalive_interval=" + c.keepalive)
 	}
 	return ipcLines.String()
 }
