@@ -135,7 +135,10 @@ func (c *ClientBind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint)
 		return
 	}
 	sizes[0] = n
-	if n > 3 {
+	// Only strip the reserved field when the reserved-bytes feature is in use.
+	// Leaving these bytes intact otherwise keeps AmneziaWG magic headers (which
+	// occupy this region) readable on the receive path.
+	if n > 3 && c.hasReserved() {
 		b := packets[0]
 		clear(b[1:4])
 	}
@@ -182,7 +185,11 @@ func (c *ClientBind) Send(bufs [][]byte, ep conn.Endpoint, offset int) error {
 			if !loaded {
 				reserved = c.reserved
 			}
-			copy(buf[1:4], reserved[:])
+			// Skip when no reserved value is configured so AmneziaWG magic
+			// headers occupying these bytes are not overwritten.
+			if reserved != ([3]uint8{}) {
+				copy(buf[1:4], reserved[:])
+			}
 		}
 		_, err = udpConn.WriteToUDPAddrPort(buf, destination)
 		if err != nil {
@@ -209,6 +216,13 @@ func (c *ClientBind) SetReservedForEndpoint(destination netip.AddrPort, reserved
 	c.reservedAccess.Lock()
 	c.reservedForEndpoint[destination] = reserved
 	c.reservedAccess.Unlock()
+}
+
+// hasReserved reports whether the reserved-bytes feature is configured. When it
+// is not, the reserved field is left untouched so it can carry AmneziaWG magic
+// header bytes instead.
+func (c *ClientBind) hasReserved() bool {
+	return c.reserved != [3]uint8{} || len(c.reservedForEndpoint) > 0
 }
 
 type wireConn struct {

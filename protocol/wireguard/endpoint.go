@@ -49,6 +49,9 @@ type Endpoint struct {
 	onDemand       bool
 	bindAccess     sync.Mutex
 	started        atomic.Bool
+	scope          atomic.Pointer[adapter.Scope]
+	startOnce      sync.Once
+	startErr       error
 }
 
 func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.WireGuardEndpointOptions) (adapter.Endpoint, error) {
@@ -124,11 +127,12 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 				PublicKey:                   it.PublicKey,
 				PreSharedKey:                it.PreSharedKey,
 				AllowedIPs:                  it.AllowedIPs,
-				PersistentKeepaliveInterval: it.PersistentKeepaliveInterval,
+				PersistentKeepaliveInterval: string(it.PersistentKeepaliveInterval),
 				Reserved:                    it.Reserved,
 			}
 		}),
-		Workers: options.Workers,
+		Workers:   options.Workers,
+		AmneziaWG: mapAmneziaWGOptions(options.AmneziaWG),
 	})
 	if err != nil {
 		return nil, err
@@ -137,30 +141,102 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 	return ep, nil
 }
 
-func (w *Endpoint) Start(stage adapter.StartStage, scope *adapter.Scope) error {
-	switch stage {
-	case adapter.StartStateInitialize:
-		err := w.endpoint.Initialize(oomkiller.MemoryPressure(w.ctx))
-		if err != nil {
-			return err
-		}
-		scope.Add(w.endpoint.Close)
-	case adapter.StartStateStart:
-		return w.endpoint.Start(false)
-	case adapter.StartStatePostStart:
-		err := w.endpoint.Start(true)
-		if err != nil {
-			return err
-		}
-		w.started.Store(true)
-		scope.Add(func() error {
-			w.bindAccess.Lock()
-			w.started.Store(false)
-			w.bindAccess.Unlock()
-			return nil
-		})
+func mapAmneziaWGOptions(o *option.AmneziaWGOptions) *wireguard.AmneziaWGOptions {
+	if o == nil {
+		return nil
 	}
+	var signatures []string
+	for _, sig := range []string{o.I1, o.I2, o.I3, o.I4, o.I5} {
+		if sig != "" {
+			signatures = append(signatures, sig)
+		}
+	}
+	return &wireguard.AmneziaWGOptions{
+		JunkPacketCount:              o.Jc,
+		JunkPacketMinSize:            o.Jmin,
+		JunkPacketMaxSize:            o.Jmax,
+		InitPacketJunkSize:           o.S1,
+		ResponsePacketJunkSize:       o.S2,
+		CookieReplyPacketJunkSize:    o.S3,
+		TransportPacketJunkSize:      o.S4,
+		InitPacketMagicHeader:        o.H1,
+		ResponsePacketMagicHeader:    o.H2,
+		CookieReplyPacketMagicHeader: o.H3,
+		TransportPacketMagicHeader:   o.H4,
+		SignaturePackets:             signatures,
+		HeaderProtectionKey:          o.HeaderProtectionKey,
+		ContentPaddingAddition:       string(o.ContentPaddingAddition),
+		RekeyAfterTime:               string(o.RekeyAfterTime),
+		RekeyTimeout:                 string(o.RekeyTimeout),
+		RejectAfterTime:              string(o.RejectAfterTime),
+		KeepaliveTimeout:             string(o.KeepaliveTimeout),
+		MaxHandshakeAttempts:         string(o.MaxHandshakeAttempts),
+		RandomTrailers:               o.RandomTrailers,
+		DisableCookies:               o.DisableCookies,
+	}
+}
+
+func (w *Endpoint) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	// WireGuard is brought up lazily, on first use (see ensureStarted).
+	//
+	// Doing the real bring-up from here would run it inside the endpoint
+	// manager's start loop, which holds its lock for the whole loop and runs at
+	// the "initialize" stage — before the DNS transport and outbound managers
+	// are started. A chained endpoint (detour to another WireGuard) resolves its
+	// peer through that upstream endpoint during bring-up, which re-enters
+	// EndpointManager.Get (via OutboundManager.Outbound) and tries to take the
+	// lock the loop already holds: a deadlock. Deferring to first use moves
+	// bring-up onto a connection goroutine, after everything is started and with
+	// no manager lock held.
+	//
+	// Initialize only creates the TUN device and never resolves or dials, so it
+	// stays at its stage.
+	if stage != adapter.StartStateInitialize {
+		return nil
+	}
+	err := w.endpoint.Initialize(oomkiller.MemoryPressure(w.ctx))
+	if err != nil {
+		return err
+	}
+	scope.Add(w.endpoint.Close)
+	scope.Add(func() error {
+		// Waits out an in-flight ensureStarted and keeps any later one from bringing the device up.
+		w.startOnce.Do(func() {
+			w.startErr = net.ErrClosed
+		})
+		w.bindAccess.Lock()
+		w.started.Store(false)
+		w.bindAccess.Unlock()
+		return nil
+	})
+	w.scope.Store(scope)
 	return nil
+}
+
+func (w *Endpoint) ensureStarted() error {
+	scope := w.scope.Load()
+	if scope == nil {
+		return E.New("WireGuard is not ready yet")
+	}
+	w.startOnce.Do(func() {
+		if scope.Context().Err() != nil {
+			w.startErr = net.ErrClosed
+			return
+		}
+		// Start(false) brings up the device when all peers use IP endpoints;
+		// Start(true) resolves and brings up when any peer endpoint is a domain.
+		// Exactly one performs the real bring-up, the other is a no-op, so both
+		// peer kinds are covered. Start(false) never resolves or dials, so it
+		// cannot re-enter the manager lock.
+		w.startErr = w.endpoint.Start(false)
+		if w.startErr == nil {
+			w.startErr = w.endpoint.Start(true)
+		}
+		if w.startErr == nil {
+			w.started.Store(true)
+		}
+	})
+	return w.startErr
 }
 
 func (w *Endpoint) InterfaceUpdated(ctx context.Context) {
@@ -191,6 +267,16 @@ func (w *Endpoint) updateBind(ctx context.Context) {
 }
 
 func (w *Endpoint) PreMatchFlow(network string, destination netip.Addr) adapter.PreMatchAction {
+	// The tun inbound probes every endpoint without a destination while it starts
+	// (GSO check). That is not a use, so it must not bring WireGuard up.
+	if !destination.IsValid() {
+		return adapter.PreMatchFlow
+	}
+	if err := w.ensureStarted(); err != nil {
+		w.logger.Error(E.Cause(err, "start WireGuard"))
+		// Fall back to the userspace path, which reports the error per connection.
+		return adapter.PreMatchContinue
+	}
 	return adapter.PreMatchFlow
 }
 
@@ -233,8 +319,8 @@ func (w *Endpoint) NewDNSPacket(payload []byte, source M.Socksaddr, destination 
 }
 
 func (w *Endpoint) WritePackets(packets [][]byte) error {
-	if !w.started.Load() {
-		return E.New("WireGuard is not ready yet")
+	if err := w.ensureStarted(); err != nil {
+		return err
 	}
 	return w.endpoint.WritePackets(packets)
 }
@@ -290,8 +376,8 @@ func (w *Endpoint) DialContext(ctx context.Context, network string, destination 
 	case N.NetworkUDP:
 		w.logger.InfoContext(ctx, "outbound packet connection to ", destination)
 	}
-	if !w.started.Load() {
-		return nil, E.New("WireGuard is not ready yet")
+	if err := w.ensureStarted(); err != nil {
+		return nil, err
 	}
 	if destination.IsDomain() {
 		destinationAddresses, err := w.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
@@ -307,8 +393,8 @@ func (w *Endpoint) DialContext(ctx context.Context, network string, destination 
 
 func (w *Endpoint) ListenPacketWithDestination(ctx context.Context, destination M.Socksaddr) (net.PacketConn, netip.Addr, error) {
 	w.logger.InfoContext(ctx, "outbound packet connection to ", destination)
-	if !w.started.Load() {
-		return nil, netip.Addr{}, E.New("WireGuard is not ready yet")
+	if err := w.ensureStarted(); err != nil {
+		return nil, netip.Addr{}, err
 	}
 	if destination.IsDomain() {
 		destinationAddresses, err := w.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
