@@ -49,8 +49,9 @@ const (
 )
 
 const (
-	TypeSelector = "selector"
-	TypeURLTest  = "urltest"
+	TypeSelector     = "selector"
+	TypeURLTest      = "urltest"
+	TypeAutoSelector = "auto-selector"
 )
 
 func ProxyDisplayName(proxyType string) string {
@@ -125,6 +126,8 @@ func ProxyDisplayName(proxyType string) string {
 		return "Selector"
 	case TypeURLTest:
 		return "URLTest"
+	case TypeAutoSelector:
+		return "Auto Selector"
 	default:
 		return "Unknown"
 	}
