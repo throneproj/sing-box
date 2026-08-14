@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"reflect"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -46,8 +47,11 @@ type Outbound struct {
 	fallbackDelay  time.Duration
 	isEmpty        bool
 	myAddresses    common.TypedValue[[]netip.Prefix]
+	myAddressesAt  atomic.Int64
 	icmpPort       *ping.Port
 }
+
+const myAddressesRetryInterval = time.Second
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.DirectOutboundOptions) (adapter.Outbound, error) {
 	options.UDPFragmentDefault = true
@@ -98,7 +102,13 @@ func (h *Outbound) Start(stage adapter.StartStage) error {
 	return nil
 }
 
+// InterfaceUpdated only fires when the default interface changes, which bringing up
+// a TUN device does not do, and the interface finder is refreshed on a delay after it
+// appears; without the on-demand retry below the guard can stay empty indefinitely.
 func (h *Outbound) fetchMyAddresses() {
+	if h.network == nil {
+		return
+	}
 	interfaceMonitor := h.network.InterfaceMonitor()
 	if interfaceMonitor == nil {
 		return
@@ -107,6 +117,20 @@ func (h *Outbound) fetchMyAddresses() {
 	if len(myInterfaceNames) == 0 {
 		return
 	}
+	myAddresses, found := h.findMyAddresses(myInterfaceNames)
+	if !found {
+		if h.network.UpdateInterfaces() != nil {
+			return
+		}
+		myAddresses, found = h.findMyAddresses(myInterfaceNames)
+		if !found {
+			return
+		}
+	}
+	h.myAddresses.Store(myAddresses)
+}
+
+func (h *Outbound) findMyAddresses(myInterfaceNames []string) ([]netip.Prefix, bool) {
 	var (
 		myAddresses []netip.Prefix
 		found       bool
@@ -119,10 +143,18 @@ func (h *Outbound) fetchMyAddresses() {
 		found = true
 		myAddresses = append(myAddresses, myInterface.Addresses...)
 	}
-	if !found {
+	return myAddresses, found
+}
+
+// Rate-limited so that a TUN whose addresses never resolve costs one interface
+// enumeration per second rather than one per dial.
+func (h *Outbound) retryFetchMyAddresses() {
+	now := time.Now().UnixNano()
+	last := h.myAddressesAt.Load()
+	if now-last < int64(myAddressesRetryInterval) || !h.myAddressesAt.CompareAndSwap(last, now) {
 		return
 	}
-	h.myAddresses.Store(myAddresses)
+	h.fetchMyAddresses()
 }
 
 func (h *Outbound) InterfaceUpdated(ctx context.Context) {
@@ -133,7 +165,12 @@ func (h *Outbound) InterfaceUpdated(ctx context.Context) {
 }
 
 func (h *Outbound) isMyLoopbackAddress(addresses ...netip.Addr) bool {
-	for _, prefix := range h.myAddresses.Load() {
+	myAddresses := h.myAddresses.Load()
+	if len(myAddresses) == 0 {
+		h.retryFetchMyAddresses()
+		myAddresses = h.myAddresses.Load()
+	}
+	for _, prefix := range myAddresses {
 		for _, address := range addresses {
 			if !C.IsDarwin && prefix.Addr() == address {
 				continue
