@@ -22,6 +22,17 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// Loopback addresses the Throne clients write into the adapter DNS settings:
+// localAddr is the address our own system DNS listens on, while the two mark
+// addresses are written alongside it to signal that the user configured a
+// custom DNS. When a mark is present the local address is dropped, so local
+// DNS queries go to the user's servers instead of looping back into us.
+const (
+	localAddr    = "127.1.1.1"
+	dhcpMarkAddr = "127.1.2.3"
+	setMarkAddr  = "127.3.2.1"
+)
+
 type Source struct {
 	interfaceMonitor tun.DefaultInterfaceMonitor
 	access           sync.Mutex
@@ -143,11 +154,21 @@ func (s *Source) readConfig() *Config {
 		myInterfaces = s.interfaceMonitor.MyInterfaces()
 	}
 	var servers []M.Socksaddr
+	var customDNS bool
 	for _, address := range dnsAddresses {
 		if slices.Contains(myInterfaces, address.ifName) {
 			continue
 		}
+		if addrString := address.Addr.String(); addrString == dhcpMarkAddr || addrString == setMarkAddr {
+			customDNS = true
+			continue
+		}
 		servers = append(servers, M.SocksaddrFrom(address.Addr, 53))
+	}
+	if customDNS {
+		servers = common.Filter(servers, func(it M.Socksaddr) bool {
+			return it.Addr.String() != localAddr
+		})
 	}
 	config.Servers = common.Uniq(servers)
 	return config

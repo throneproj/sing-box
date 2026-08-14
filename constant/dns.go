@@ -17,6 +17,7 @@ const (
 const (
 	DNSTypeLegacy      = "legacy"
 	DNSTypeUDP         = "udp"
+	DNSTypeUnderlying  = "underlying"
 	DNSTypeTCP         = "tcp"
 	DNSTypeTLS         = "tls"
 	DNSTypeHTTPS       = "https"
