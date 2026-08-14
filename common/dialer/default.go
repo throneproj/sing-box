@@ -21,8 +21,6 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
-
-	"github.com/database64128/tfo-go/v2"
 )
 
 var (
@@ -31,8 +29,8 @@ var (
 )
 
 type DefaultDialer struct {
-	dialer4                tfo.Dialer
-	dialer6                tfo.Dialer
+	dialer4                tcpDialer
+	dialer6                tcpDialer
 	udpDialer4             net.Dialer
 	udpDialer6             net.Dialer
 	udpListener            net.ListenConfig
@@ -223,8 +221,34 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 	if options.TCPMultiPath {
 		dialer4.SetMultipathTCP(true)
 	}
-	tcpDialer4 := tfo.Dialer{Dialer: dialer4, DisableTFO: !options.TCPFastOpen}
-	tcpDialer6 := tfo.Dialer{Dialer: dialer6, DisableTFO: !options.TCPFastOpen}
+	var tlsFragment *TLSFragment = nil
+	if options.TLSFragment != nil && options.TLSFragment.Enabled {
+		tlsFragment = &TLSFragment{}
+		if options.TCPFastOpen {
+			return nil, E.New("TLS Fragmentation is not compatible with TCP Fast Open, set `tcp_fast_open` to `false` in your outbound if you intend to enable TLS fragmentation.")
+		}
+		tlsFragment.Enabled = true
+
+		sleep, err := option.Parse2IntRange(options.TLSFragment.Sleep)
+		if err != nil {
+			return nil, E.Cause(err, "invalid TLS fragment sleep period supplied")
+		}
+		tlsFragment.Sleep = sleep
+
+		size, err := option.Parse2IntRange(options.TLSFragment.Size)
+		if err != nil {
+			return nil, E.Cause(err, "invalid TLS fragment size supplied")
+		}
+		tlsFragment.Size = size
+	}
+	tcpDialer4, err := newTCPDialer(dialer4, options.TCPFastOpen, tlsFragment)
+	if err != nil {
+		return nil, err
+	}
+	tcpDialer6, err := newTCPDialer(dialer6, options.TCPFastOpen, tlsFragment)
+	if err != nil {
+		return nil, err
+	}
 	return &DefaultDialer{
 		dialer4:                tcpDialer4,
 		dialer6:                tcpDialer6,
