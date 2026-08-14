@@ -1,0 +1,457 @@
+package group
+
+import (
+	"errors"
+	"math"
+	"net"
+	"os"
+	"sort"
+	"strings"
+	"syscall"
+	"time"
+)
+
+// Ring-slot sentinels. rttUntested marks a slot that has never been written (or
+// one that was rolled back after being blamed on a local outage); rttFailed
+// marks a probe that errored while the local network was believed to be up.
+const (
+	rttUntested = time.Duration(-1)
+	rttFailed   = time.Duration(math.MaxInt64)
+)
+
+// Health tiers. Ordering between tiers dominates the per-tier comparators: an
+// untested member outranks a known-dead one so the prober keeps exploring
+// instead of settling on servers it has already proven broken.
+const (
+	tierHealthy = iota
+	tierUntested
+	tierDead
+	tierCooldown
+)
+
+type memberStats struct {
+	All       int
+	Fail      int
+	Average   time.Duration
+	Deviation time.Duration
+	Min       time.Duration
+	Max       time.Duration
+}
+
+// Alive reports whether at least one probe succeeded inside the validity window.
+func (s memberStats) Alive() bool {
+	return s.All > s.Fail
+}
+
+func (s memberStats) FailRatio() float64 {
+	if s.All == 0 {
+		return 0
+	}
+	return float64(s.Fail) / float64(s.All)
+}
+
+type pingSample struct {
+	at    time.Time
+	value time.Duration
+}
+
+// memberHealth is the rolling health record of one group member: a ring of the
+// last `capacity` probe results, plus the passive signal that real dials give us
+// for free. Every field is guarded by AutoSelector.access.
+type memberHealth struct {
+	tag string
+
+	capacity int
+	validity time.Duration
+	idx      int
+	samples  []pingSample
+
+	dialTotal     int
+	dialFailTotal int
+	dialFail      int
+	lastDialErr   string
+
+	lastOK    time.Time
+	lastProbe time.Time
+	networkAt time.Time
+	probes    int
+	// The most recent failed probe or dial. Unlike the cooldown it survives a
+	// success, since fail-back counts the checks passed after it.
+	lastFailure time.Time
+
+	// Cooldown after consecutive dial failures. cooldownAt records when the
+	// penalty was applied so an outage detected moments later can roll it back
+	// (a dead wifi must not look like a dead server).
+	cooldownUntil time.Time
+	cooldownAt    time.Time
+	cooldownStep  int
+
+	passive passiveHealth
+}
+
+func newMemberHealth(tag string, capacity int, validity time.Duration) *memberHealth {
+	h := &memberHealth{
+		tag:      tag,
+		capacity: capacity,
+		validity: validity,
+		idx:      -1,
+		samples:  make([]pingSample, capacity),
+	}
+	for i := range h.samples {
+		h.samples[i].value = rttUntested
+	}
+	return h
+}
+
+func (h *memberHealth) put(value time.Duration, at time.Time) {
+	h.idx = (h.idx + 1) % h.capacity
+	h.samples[h.idx] = pingSample{at: at, value: value}
+	h.probes++
+	h.lastProbe = at
+	switch value {
+	case rttFailed:
+		h.noteFailure(at)
+	case rttUntested:
+	default:
+		h.lastOK = at
+	}
+}
+
+func (h *memberHealth) noteFailure(at time.Time) {
+	if at.After(h.lastFailure) {
+		h.lastFailure = at
+	}
+}
+
+// rollbackFailuresSince un-records failure samples taken from `since` onward.
+// Called when the local network turns out to have been down while those probes
+// ran, so the samples say nothing about the member.
+func (h *memberHealth) rollbackFailuresSince(since time.Time) int {
+	rolled := 0
+	for i := range h.samples {
+		s := &h.samples[i]
+		if s.value == rttFailed && !s.at.Before(since) {
+			s.value = rttUntested
+			rolled++
+		}
+	}
+	if !h.lastFailure.Before(since) {
+		// Only the ring remembers earlier failures; a dial failure before the window is forgotten.
+		h.lastFailure = time.Time{}
+		for _, s := range h.samples {
+			if s.value == rttFailed {
+				h.noteFailure(s.at)
+			}
+		}
+	}
+	return rolled
+}
+
+// streak counts the successful checks recorded since the last failure.
+func (h *memberHealth) streak() int {
+	count := 0
+	for _, s := range h.samples {
+		if s.value != rttFailed && s.value != rttUntested && s.at.After(h.lastFailure) {
+			count++
+		}
+	}
+	return count
+}
+
+// settled reports whether a member has proven its recovery for long enough to
+// be moved back up to. One that never failed has nothing to prove.
+func (h *memberHealth) settled(now time.Time, checks int, delay time.Duration) bool {
+	if h.lastFailure.IsZero() {
+		return true
+	}
+	return now.Sub(h.lastFailure) >= delay && h.streak() >= checks
+}
+
+// rollbackSince reports how far back an outage invalidates what was measured:
+// the whole round that raised the alarm, or the fixed window when the alarm came
+// from the dial path and there is no round to scope to. The window is the floor,
+// never the ceiling — probes are spread over half the tier interval, so with an
+// interval of minutes it covers only the tail of a round and would leave the
+// earlier failures, taken while the link was already dying, on the record.
+func rollbackSince(now time.Time, roundStartedAt time.Time) time.Time {
+	window := now.Add(-outageRollbackWindow)
+	if roundStartedAt.IsZero() || roundStartedAt.After(window) {
+		return window
+	}
+	return roundStartedAt
+}
+
+func (h *memberHealth) stats(now time.Time) memberStats {
+	stats := memberStats{Min: rttFailed}
+	var (
+		sum   time.Duration
+		count int
+		valid []time.Duration
+	)
+	for _, s := range h.samples {
+		switch {
+		case s.value == rttUntested || now.Sub(s.at) > h.validity:
+			continue
+		case s.value == rttFailed:
+			stats.Fail++
+			continue
+		}
+		count++
+		sum += s.value
+		valid = append(valid, s.value)
+		// Samples from before a network change describe another path.
+		if s.at.After(h.networkAt) {
+			stats.Max = max(stats.Max, s.value)
+			stats.Min = min(stats.Min, s.value)
+		}
+	}
+	stats.All = count + stats.Fail
+	if stats.Min == rttFailed {
+		stats.Min = 0
+	}
+	if count == 0 {
+		return stats
+	}
+	stats.Average = sum / time.Duration(count)
+	if count < 2 {
+		// A lone sample has no spread; zero would report it as perfectly steady.
+		stats.Deviation = stats.Average / 2
+	} else {
+		variance := float64(0)
+		for _, v := range valid {
+			variance += math.Pow(float64(v-stats.Average), 2)
+		}
+		stats.Deviation = time.Duration(math.Sqrt(variance / float64(count)))
+	}
+	return stats
+}
+
+func (h *memberHealth) inCooldown(now time.Time) bool {
+	return now.Before(h.cooldownUntil)
+}
+
+// penalize applies the next backoff step after a failed dial.
+func (h *memberHealth) penalize(now time.Time, backoff []time.Duration, err error) {
+	h.dialTotal++
+	h.dialFailTotal++
+	h.dialFail++
+	if err != nil {
+		h.lastDialErr = err.Error()
+	}
+	step := h.cooldownStep
+	if step >= len(backoff) {
+		step = len(backoff) - 1
+	}
+	h.cooldownUntil = now.Add(backoff[step])
+	h.cooldownAt = now
+	if h.cooldownStep < len(backoff)-1 {
+		h.cooldownStep++
+	}
+	h.noteFailure(now)
+}
+
+// reward clears the penalty state after a dial succeeds.
+func (h *memberHealth) reward(now time.Time) {
+	h.dialTotal++
+	h.dialFail = 0
+	h.cooldownStep = 0
+	h.cooldownUntil = time.Time{}
+	h.cooldownAt = time.Time{}
+	h.lastDialErr = ""
+	h.lastOK = now
+}
+
+// clearCooldown cancels a dial penalty outdated by newer proof that the member works.
+func (h *memberHealth) clearCooldown() {
+	h.cooldownUntil = time.Time{}
+	h.cooldownAt = time.Time{}
+	h.cooldownStep = 0
+	h.dialFail = 0
+}
+
+// clearCooldownSince cancels a cooldown that was applied from `since` onward.
+func (h *memberHealth) clearCooldownSince(since time.Time) bool {
+	if h.cooldownAt.IsZero() || h.cooldownAt.Before(since) {
+		return false
+	}
+	h.clearCooldown()
+	return true
+}
+
+// rankedNode is an immutable per-evaluation snapshot of a member. The health
+// record keeps mutating while routing reads the ranking, so selection always
+// works off these copies.
+type rankedNode struct {
+	tag   string
+	tier  int
+	stats memberStats
+	// Average, or Min while in use: load only ever adds delay, so the best recent time is what the server can do.
+	latency time.Duration
+	// Set under the priority strategy only.
+	priority int
+	settled  bool
+	// Passive scoring holds the member out of the selection.
+	suspect bool
+	// Healthy, but its latency is over max_rtt.
+	slow bool
+}
+
+func (n *rankedNode) state() string {
+	switch n.tier {
+	case tierHealthy:
+		if n.suspect {
+			return "suspect"
+		}
+		if n.stats.Fail > 0 {
+			return "degraded"
+		}
+		return "ok"
+	case tierUntested:
+		return "untested"
+	case tierDead:
+		return "dead"
+	default:
+		return "cooldown"
+	}
+}
+
+// stableByPrior pre-orders nodes by their position in the previous ranking so
+// the stable sort that follows keeps equally-good members from shuffling
+// between rounds. Members with no prior sort last.
+func stableByPrior(nodes []*rankedNode, prior map[string]int) {
+	sort.SliceStable(nodes, func(i, j int) bool {
+		li, liOK := prior[nodes[i].tag]
+		lj, ljOK := prior[nodes[j].tag]
+		if liOK != ljOK {
+			return liOK
+		}
+		return li < lj
+	})
+}
+
+// sortNodes orders by tier, then by average, failures and deviation. Suspect
+// members, then slow ones, follow the other healthy ones. byPriority puts
+// settled healthy members first, then orders every tier by priority.
+func sortNodes(nodes []*rankedNode, byPriority bool) {
+	sort.SliceStable(nodes, func(i, j int) bool {
+		l, r := nodes[i], nodes[j]
+		if l.tier != r.tier {
+			return l.tier < r.tier
+		}
+		if l.tier == tierHealthy && l.suspect != r.suspect {
+			return r.suspect
+		}
+		if l.tier == tierHealthy && l.slow != r.slow {
+			return r.slow
+		}
+		if byPriority {
+			if l.tier == tierHealthy && l.settled != r.settled {
+				return l.settled
+			}
+			if l.priority != r.priority {
+				return l.priority < r.priority
+			}
+		}
+		if l.tier != tierHealthy {
+			// Nothing meaningful to compare below the healthy tier; keep the
+			// incoming order (which is the caller's ranking prior).
+			return false
+		}
+		if l.stats.Average != r.stats.Average {
+			return l.stats.Average < r.stats.Average
+		}
+		if l.stats.Fail != r.stats.Fail {
+			return l.stats.Fail < r.stats.Fail
+		}
+		if l.stats.All != r.stats.All {
+			return l.stats.All > r.stats.All
+		}
+		if l.stats.Deviation != r.stats.Deviation {
+			return l.stats.Deviation < r.stats.Deviation
+		}
+		// Fully tied: the stable sort keeps the incoming order, which the caller
+		// has pre-arranged to be the previous ranking. Breaking the tie on tag
+		// here would shuffle equal members alphabetically every round and throw
+		// that stability away.
+		return false
+	})
+}
+
+// applyBaselines picks the qualified prefix of an already-sorted healthy slice,
+// walking each baseline until `expected` members average under it. With no
+// baselines configured it degrades to a plain top-N cut.
+func applyBaselines(nodes []*rankedNode, baselines []time.Duration, expected int) []*rankedNode {
+	if len(nodes) == 0 {
+		return nil
+	}
+	if expected <= 0 {
+		expected = 1
+	}
+	if expected >= len(nodes) {
+		return nodes
+	}
+	if len(baselines) == 0 {
+		return nodes[:expected]
+	}
+	count := 0
+	for _, baseline := range baselines {
+		for i := count; i < len(nodes); i++ {
+			if nodes[i].stats.Average >= baseline {
+				break
+			}
+			count = i + 1
+		}
+		if count >= expected {
+			break
+		}
+	}
+	if count < expected {
+		count = expected
+	}
+	return nodes[:count]
+}
+
+// isLocalNetworkError reports whether an error blames the local network stack
+// rather than the remote server. These never count against a member.
+func isLocalNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch errno {
+		case syscall.ENETUNREACH, syscall.ENETDOWN, syscall.EHOSTUNREACH, syscall.ENETRESET:
+			return true
+		}
+		// Windows reports these as WSA codes that do not map onto the POSIX
+		// constants above, so match them numerically.
+		switch uintptr(errno) {
+		case 10050, // WSAENETDOWN
+			10051, // WSAENETUNREACH
+			10052, // WSAENETRESET
+			10065: // WSAEHOSTUNREACH
+			return true
+		}
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && !dnsErr.IsNotFound {
+		return true
+	}
+	if errors.Is(err, syscall.ECONNABORTED) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"network is unreachable",
+		"network is down",
+		"no route to host",
+		"host is unreachable",
+		"can not resolve",
+		"cannot assign requested address",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
