@@ -161,3 +161,8 @@ type URLTestGroup interface {
 	URLTest(ctx context.Context) (map[string]uint16, error)
 	PerformUpdateCheck()
 }
+
+// DialFailureListener is told when a routed connection fails to dial outbound, the member the group resolved to.
+type DialFailureListener interface {
+	DialFailed(outbound Outbound, network string, err error)
+}
