@@ -42,6 +42,7 @@ type UTLSClientConfig struct {
 	spoofMethod           tlsspoof.Method
 	mixedCaseSNI          bool
 	paddingSize           option.IntRange
+	customSNI             string
 }
 
 func (c *UTLSClientConfig) ServerName() string {
@@ -59,11 +60,18 @@ func (c *UTLSClientConfig) SetServerName(serverName string) {
 		}
 		return
 	}
+	wireName := serverName
+	if c.customSNI != "" {
+		wireName = c.customSNI
+		if c.verifyServerName {
+			c.config.InsecureServerNameToVerify = serverName
+		}
+	}
 	if c.mixedCaseSNI {
-		c.config.ServerName = randomizeCase(serverName)
+		c.config.ServerName = randomizeCase(wireName)
 		return
 	}
-	c.config.ServerName = serverName
+	c.config.ServerName = wireName
 }
 
 func (c *UTLSClientConfig) NextProtos() []string {
@@ -133,6 +141,7 @@ func (c *UTLSClientConfig) Clone() Config {
 		spoofMethod:           c.spoofMethod,
 		mixedCaseSNI:          c.mixedCaseSNI,
 		paddingSize:           c.paddingSize,
+		customSNI:             c.customSNI,
 	}
 	cloned.SetServerName(cloned.serverName)
 	return cloned
