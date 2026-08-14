@@ -135,6 +135,7 @@ type OutboundTLSOptions struct {
 	ECH                        *OutboundECHOptions             `json:"ech,omitempty"`
 	UTLS                       *OutboundUTLSOptions            `json:"utls,omitempty"`
 	Reality                    *OutboundRealityOptions         `json:"reality,omitempty"`
+	TLSTricks                  *TLSTricksOptions               `json:"tls_tricks,omitempty"`
 }
 
 type OutboundTLSOptionsContainer struct {
