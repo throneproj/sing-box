@@ -31,18 +31,15 @@ type slowOpenConn struct {
 	err         error
 }
 
-func DialSlowContext(dialer *tfo.Dialer, ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+func DialSlowContext(dialer *tcpDialer, ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	if dialer.DisableTFO || N.NetworkName(network) != N.NetworkTCP {
-		switch N.NetworkName(network) {
-		case N.NetworkTCP, N.NetworkUDP:
-			return dialer.Dialer.DialContext(ctx, network, destination.String())
-		default:
-			return dialer.Dialer.DialContext(ctx, network, destination.AddrString())
-		}
+		// ExtendedTCPDialer.DialContext applies TLS fragmentation when enabled,
+		// and otherwise performs a plain dial (handling String/AddrString).
+		return dialer.DialContext(ctx, network, destination)
 	}
 	dialCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	return &slowOpenConn{
-		dialer:      dialer,
+		dialer:      &tfo.Dialer{Dialer: dialer.Dialer, DisableTFO: dialer.DisableTFO},
 		ctx:         dialCtx,
 		cancel:      cancel,
 		network:     network,
