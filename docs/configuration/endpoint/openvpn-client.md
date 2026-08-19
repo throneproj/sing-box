@@ -34,6 +34,8 @@
   "auth_retry": "none",
   "static_challenge": "",
   "static_challenge_echo": false,
+  "auth_nocache": false,
+  "query_credentials": false,
   "static_key": [],
   "static_key_path": "",
   "key_direction": "",
@@ -234,6 +236,16 @@ Static challenge text shown when requesting an authentication response.
 ### static_challenge_echo
 
 Show the static challenge response as plain text.
+
+### auth_nocache
+
+Forget the username/password right after sending it, so every connection attempt and renegotiation asks for it again, unless the server pushed an `auth-token`.
+
+### query_credentials
+
+Ask for the username and password through an authentication challenge instead of using `username` and `password`.
+
+`username` pre-fills the challenge. Ignored when `static_challenge` is set.
 
 ### static_key
 

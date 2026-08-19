@@ -33,7 +33,11 @@ type OpenConnectTunnelInfo struct {
 	Transport      string
 	IPv4           []netip.Prefix
 	IPv6           []netip.Prefix
+	Routes         []netip.Prefix
+	ExcludedRoutes []netip.Prefix
 	DNS            []netip.Addr
+	// SearchDomains holds every suffix PreferredDomain matches: search domains plus split-DNS suffixes.
+	SearchDomains  []string
 	MTU            uint32
 	ConnectedSince time.Time
 }
