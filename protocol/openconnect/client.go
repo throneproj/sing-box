@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -371,6 +372,11 @@ func (e *Endpoint) handleTunnelConfiguration(event openconnect.TunnelConfigurati
 		e.deviceStarted = true
 	}
 	preferredDomains := buildPreferredDomains(configuration)
+	searchDomains := make([]string, 0, len(preferredDomains))
+	for domain := range preferredDomains {
+		searchDomains = append(searchDomains, domain)
+	}
+	slices.Sort(searchDomains)
 	var ipv4Addresses []netip.Prefix
 	var ipv6Addresses []netip.Prefix
 	for _, address := range configuration.Addresses {
@@ -393,12 +399,19 @@ func (e *Endpoint) handleTunnelConfiguration(event openconnect.TunnelConfigurati
 		state.preferredDomains = preferredDomains
 		state.configuration = configuration
 		state.tunnelInfo = adapter.OpenConnectTunnelInfo{
-			Server:         e.server,
-			Flavor:         e.flavor,
-			Transport:      state.tunnelInfo.Transport,
-			IPv4:           ipv4Addresses,
-			IPv6:           ipv6Addresses,
+			Server:    e.server,
+			Flavor:    e.flavor,
+			Transport: state.tunnelInfo.Transport,
+			IPv4:      ipv4Addresses,
+			IPv6:      ipv6Addresses,
+			Routes: common.Map(configuration.Routes, func(route openconnecttransport.Route) netip.Prefix {
+				return route.Prefix
+			}),
+			ExcludedRoutes: common.Map(configuration.ExcludedRoutes, func(route openconnecttransport.Route) netip.Prefix {
+				return route.Prefix
+			}),
 			DNS:            configuration.DNS,
+			SearchDomains:  searchDomains,
 			MTU:            configuration.MTU,
 			ConnectedSince: connectedSince,
 		}
