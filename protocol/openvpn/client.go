@@ -555,6 +555,13 @@ func (c *ClientEndpoint) handleTunnelConfiguration(event ovpn.TunnelConfiguratio
 		state.tunnelInfo.IPv4 = event.Configuration.LocalIPv4
 		state.tunnelInfo.IPv6 = event.Configuration.LocalIPv6
 		state.tunnelInfo.DNS = event.Configuration.DNS
+		state.tunnelInfo.Routes = common.Map(configuration.Routes, func(route ovpntransport.Route) netip.Prefix {
+			return route.Prefix
+		})
+		state.tunnelInfo.ExcludedRoutes = common.Map(configuration.ExcludedRoutes, func(route ovpntransport.Route) netip.Prefix {
+			return route.Prefix
+		})
+		state.tunnelInfo.SearchDomains = preferredDomains
 		state.tunnelInfo.MTU = configuration.MTU
 		if event.Reason == ovpn.TunnelConfigurationEventInitial || state.tunnelInfo.ConnectedSince.IsZero() {
 			state.tunnelInfo.ConnectedSince = time.Now()

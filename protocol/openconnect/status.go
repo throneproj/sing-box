@@ -74,6 +74,9 @@ func (e *Endpoint) OpenConnectStatus() adapter.OpenConnectStatus {
 		tunnelInfo.IPv4 = slices.Clone(tunnelInfo.IPv4)
 		tunnelInfo.IPv6 = slices.Clone(tunnelInfo.IPv6)
 		tunnelInfo.DNS = slices.Clone(tunnelInfo.DNS)
+		tunnelInfo.Routes = slices.Clone(tunnelInfo.Routes)
+		tunnelInfo.ExcludedRoutes = slices.Clone(tunnelInfo.ExcludedRoutes)
+		tunnelInfo.SearchDomains = slices.Clone(tunnelInfo.SearchDomains)
 		status.TunnelInfo = &tunnelInfo
 	default:
 		status.State = adapter.OpenConnectStateConnecting
