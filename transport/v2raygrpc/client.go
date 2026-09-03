@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/streamctx"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/option"
 	M "github.com/sagernet/sing/common/metadata"
@@ -102,8 +103,10 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 		return nil, err
 	}
 	client := NewGunServiceClient(clientConn).(GunServiceCustomNameClient)
-	ctx, cancel := context.WithCancelCause(ctx)
-	stream, err := client.TunCustomName(ctx, c.serviceName)
+	// The stream is the connection: ctx only governs the dial, or its deadline would become the stream's grpc-timeout.
+	streamCtx, cancel, dialed := streamctx.New(c.ctx, ctx)
+	stream, err := client.TunCustomName(streamCtx, c.serviceName)
+	dialed()
 	if err != nil {
 		cancel(err)
 		return nil, err
