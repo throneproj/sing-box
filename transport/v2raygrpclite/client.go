@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/streamctx"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/transport/v2rayhttp"
@@ -79,6 +80,8 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 
 func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 	pipeInReader, pipeInWriter := io.Pipe()
+	// The stream is the connection: ctx only governs the dial, or a DNS query cancelling it would reset the tunnel.
+	streamCtx, cancel, dialed := streamctx.New(c.ctx, ctx)
 	request := &http.Request{
 		Method: http.MethodPost,
 		Body:   pipeInReader,
@@ -86,15 +89,19 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 		Header: defaultClientHeader,
 		Host:   c.host,
 	}
-	request = request.WithContext(ctx)
-	conn := newLateGunConn(pipeInWriter)
+	request = request.WithContext(streamCtx)
+	conn := newLateGunConn(pipeInWriter, cancel)
 	go func() {
 		response, err := c.transport.RoundTrip(request)
+		dialed()
 		if err != nil {
+			cancel(err)
 			conn.setup(nil, err)
 		} else if response.StatusCode != 200 {
 			response.Body.Close()
-			conn.setup(nil, E.New("v2ray-grpc: unexpected status: ", response.Status))
+			err = E.New("v2ray-grpc: unexpected status: ", response.Status)
+			cancel(err)
+			conn.setup(nil, err)
 		} else {
 			conn.setup(response.Body, nil)
 		}

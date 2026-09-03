@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/streamctx"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -120,13 +121,15 @@ func (c *Client) dialHTTP(ctx context.Context) (net.Conn, error) {
 
 func (c *Client) dialHTTP2(ctx context.Context) (net.Conn, error) {
 	pipeInReader, pipeInWriter := io.Pipe()
+	// The stream is the connection: ctx only governs the dial, or a DNS query cancelling it would reset the tunnel.
+	streamCtx, cancel, dialed := streamctx.New(c.ctx, ctx)
 	request := &http.Request{
 		Method: c.method,
 		Body:   pipeInReader,
 		URL:    &c.requestURL,
 		Header: c.headers.Clone(),
 	}
-	request = request.WithContext(ctx)
+	request = request.WithContext(streamCtx)
 	switch hostLen := len(c.host); hostLen {
 	case 0:
 		// https://github.com/v2fly/v2ray-core/blob/master/transport/internet/http/config.go#L13
@@ -136,14 +139,18 @@ func (c *Client) dialHTTP2(ctx context.Context) (net.Conn, error) {
 	default:
 		request.Host = c.host[rand.Intn(hostLen)]
 	}
-	conn := NewLateHTTPConn(pipeInWriter)
+	conn := NewLateHTTPConn(pipeInWriter, cancel)
 	go func() {
 		response, err := c.transport.RoundTrip(request)
+		dialed()
 		if err != nil {
+			cancel(err)
 			conn.Setup(nil, err)
 		} else if response.StatusCode != 200 {
 			response.Body.Close()
-			conn.Setup(nil, E.New("v2ray-http: unexpected status: ", response.Status))
+			err = E.New("v2ray-http: unexpected status: ", response.Status)
+			cancel(err)
+			conn.Setup(nil, err)
 		} else {
 			conn.Setup(response.Body, nil)
 		}
