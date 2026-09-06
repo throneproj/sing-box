@@ -213,15 +213,20 @@ func (h *memberHealth) reward(now time.Time) {
 	h.lastOK = now
 }
 
+// clearCooldown cancels a dial penalty outdated by newer proof that the member works.
+func (h *memberHealth) clearCooldown() {
+	h.cooldownUntil = time.Time{}
+	h.cooldownAt = time.Time{}
+	h.cooldownStep = 0
+	h.dialFail = 0
+}
+
 // clearCooldownSince cancels a cooldown that was applied from `since` onward.
 func (h *memberHealth) clearCooldownSince(since time.Time) bool {
 	if h.cooldownAt.IsZero() || h.cooldownAt.Before(since) {
 		return false
 	}
-	h.cooldownUntil = time.Time{}
-	h.cooldownAt = time.Time{}
-	h.cooldownStep = 0
-	h.dialFail = 0
+	h.clearCooldown()
 	return true
 }
 

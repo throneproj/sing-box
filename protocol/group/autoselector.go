@@ -72,6 +72,11 @@ const (
 	outageRollbackWindow = 45 * time.Second
 	// How often to re-test the local network while suspended.
 	recoveryInterval = 5 * time.Second
+	// A blocked connectivity URL must delay recovery, not prevent it.
+	osResumeGrace = 5 * time.Minute
+	// Probes run while neither signal says the link is back; tiny, since most will fail.
+	optimisticProbeInterval = 30 * time.Second
+	optimisticProbeSize     = 3
 	// Distinct members failing back to back in the dial path before we spend an
 	// out-of-band connectivity check.
 	dialOutageSuspicion = 3
@@ -202,6 +207,7 @@ type AutoSelector struct {
 	pinnedTag        string
 	suspended        bool
 	suspendedSince   time.Time
+	optimisticIdx    int
 	roundsCompleted  int
 	lastRoundAt      time.Time
 	nextRoundAt      time.Time
@@ -619,6 +625,7 @@ func (s *AutoSelector) watchLoop() {
 			if health, loaded := s.members[detour.Tag()]; loaded {
 				health.put(value, now)
 				health.lastDialErr = ""
+				health.clearCooldown()
 			}
 			s.access.Unlock()
 			continue
@@ -819,6 +826,11 @@ func (s *AutoSelector) commitRound(results []probeResult, startedAt time.Time) {
 		}
 	}
 
+	// A member answering is proof the link is up, and outranks every heuristic above.
+	if outage && succeeded > 0 && s.isSuspended() {
+		outage = false
+	}
+
 	now := time.Now()
 	if outage {
 		s.enterSuspended(now, startedAt)
@@ -843,6 +855,8 @@ func (s *AutoSelector) commitRound(results []probeResult, startedAt time.Time) {
 			health.lastDialErr = result.err.Error()
 		} else if result.value != rttFailed {
 			health.lastDialErr = ""
+			// A probe is a real dial, so it outdates the penalty the member is serving.
+			health.clearCooldown()
 		}
 	}
 	s.roundsCompleted++
@@ -861,10 +875,20 @@ func (s *AutoSelector) commitRound(results []probeResult, startedAt time.Time) {
 }
 
 func (s *AutoSelector) networkInterfaceDown() bool {
+	return s.defaultInterfaceIndex() < 0
+}
+
+// defaultInterfaceIndex is -1 when the OS reports no route; the index lets recovery spot a
+// different network appearing.
+func (s *AutoSelector) defaultInterfaceIndex() int {
 	if s.network == nil {
-		return false
+		return 0
 	}
-	return s.network.DefaultNetworkInterface() == nil
+	iif := s.network.DefaultNetworkInterface()
+	if iif == nil {
+		return -1
+	}
+	return iif.Index
 }
 
 // connectivityOK probes the configured connectivity URL *without* the proxy.
@@ -934,9 +958,18 @@ func (s *AutoSelector) enterSuspended(now time.Time, since time.Time) {
 
 // recoveryLoop runs only while suspended, polling the local network far more
 // often than the normal probe interval so recovery is not delayed by a minute.
+//
+// The connectivity URL leads until osResumeGrace, then the OS route alone; an
+// optimistic probe answering overrules both.
 func (s *AutoSelector) recoveryLoop() {
 	ticker := time.NewTicker(recoveryInterval)
 	defer ticker.Stop()
+	backoff := recoveryInterval
+	var (
+		lastAttempt    time.Time
+		lastOptimistic time.Time
+		lastIndex      = -1
+	)
 	for {
 		select {
 		case <-s.close:
@@ -946,19 +979,96 @@ func (s *AutoSelector) recoveryLoop() {
 		if !s.isSuspended() {
 			return
 		}
-		if s.networkInterfaceDown() {
+		index := s.defaultInterfaceIndex()
+		if index < 0 {
+			backoff = recoveryInterval
+			lastAttempt = time.Time{}
+			lastIndex = -1
+		} else if index != lastIndex {
+			// A different default interface is a real change in network state, not just elapsed time.
+			lastIndex = index
+			backoff = recoveryInterval
+			lastAttempt = time.Time{}
+		}
+
+		now := time.Now()
+		ready := index >= 0
+		if ready && s.connectURL != "" && s.suspendedFor(now) < osResumeGrace {
+			ready = s.connectivityOK(true)
+		}
+		if !ready {
+			// Both signals can be wrong while a member still works, so keep asking a few.
+			if lastOptimistic.IsZero() || now.Sub(lastOptimistic) >= optimisticProbeInterval {
+				lastOptimistic = now
+				s.optimisticRound()
+				if !s.isSuspended() {
+					return
+				}
+			}
 			continue
 		}
-		if s.connectURL != "" && !s.connectivityOK(true) {
+
+		if !lastAttempt.IsZero() && now.Sub(lastAttempt) < backoff {
 			continue
 		}
-		// The local network answers again. Probe the active tier; a success
-		// there lifts the suspension inside commitRound.
+		lastAttempt = now
 		s.runRound(true)
 		if !s.isSuspended() {
 			return
 		}
+		// Link up but nothing answered: keep asking, just not every five seconds forever.
+		if backoff < s.interval {
+			backoff = min(backoff*2, s.interval)
+		}
 	}
+}
+
+func (s *AutoSelector) suspendedFor(now time.Time) time.Duration {
+	s.access.Lock()
+	defer s.access.Unlock()
+	if s.suspendedSince.IsZero() {
+		return 0
+	}
+	return now.Sub(s.suspendedSince)
+}
+
+// optimisticRound commits only successes: a failure while the link is believed down says
+// nothing about the member and would bury a healthy pool.
+func (s *AutoSelector) optimisticRound() {
+	batch := s.optimisticBatch()
+	if len(batch) == 0 {
+		return
+	}
+	startedAt := time.Now()
+	succeeded := make([]probeResult, 0, len(batch))
+	for _, result := range s.probeBatch(batch, true) {
+		if result.value != rttFailed {
+			succeeded = append(succeeded, result)
+		}
+	}
+	if len(succeeded) == 0 {
+		return
+	}
+	s.commitRound(succeeded, startedAt)
+}
+
+// optimisticBatch rotates through the ranking, so genuinely dead top members do not hide a
+// working one further down.
+func (s *AutoSelector) optimisticBatch() []string {
+	s.access.Lock()
+	defer s.access.Unlock()
+	if len(s.ranked) == 0 {
+		return nil
+	}
+	size := min(optimisticProbeSize, len(s.ranked))
+	batch := make([]string, 0, size)
+	for i := 0; i < size; i++ {
+		// Modulo on read, since the ranking can shrink between rounds.
+		s.optimisticIdx %= len(s.ranked)
+		batch = append(batch, s.ranked[s.optimisticIdx].tag)
+		s.optimisticIdx++
+	}
+	return batch
 }
 
 // ------------------------------------------------------------- evaluation ---
@@ -1068,6 +1178,14 @@ func (s *AutoSelector) updateNetworkSelectionLocked(network string, qualified []
 			}
 			if detour, loaded := s.outbounds[node.tag]; loaded && common.Contains(detour.Network(), network) {
 				s.setSelectedLocked(detour, network, "fallback: no qualified member", now, true)
+				return
+			}
+		}
+		// Everything is cooling down, where an outage puts the whole pool: a penalised member
+		// still beats none.
+		for _, node := range s.ranked {
+			if detour, loaded := s.outbounds[node.tag]; loaded && common.Contains(detour.Network(), network) {
+				s.setSelectedLocked(detour, network, "fallback: every member is cooling down", now, true)
 				return
 			}
 		}
