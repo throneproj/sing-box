@@ -13,6 +13,14 @@ import (
 )
 
 func TestTrustTunnelSelf(t *testing.T) {
+	testTrustTunnelSelf(t, "")
+}
+
+func TestTrustTunnelClientRandomSelf(t *testing.T) {
+	testTrustTunnelSelf(t, "a0b0/f0f0")
+}
+
+func testTrustTunnelSelf(t *testing.T, clientRandom string) {
 	_, certPem, keyPem := createSelfSignedCertificate(t, "example.org")
 	startInstance(t, option.Options{
 		Inbounds: []option.Inbound{
@@ -65,8 +73,9 @@ func TestTrustTunnelSelf(t *testing.T) {
 						Server:     "127.0.0.1",
 						ServerPort: serverPort,
 					},
-					Username: "sekai",
-					Password: "password",
+					Username:     "sekai",
+					Password:     "password",
+					ClientRandom: clientRandom,
 					OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{
 						TLS: &option.OutboundTLSOptions{
 							Enabled:         true,

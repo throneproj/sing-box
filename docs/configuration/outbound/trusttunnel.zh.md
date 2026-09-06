@@ -18,6 +18,7 @@ icon: material/new-box
   "health_check": true,
   "quic": false,
   "quic_congestion_control": "bbr",
+  "client_random": "a0b0/f0f0",
   "tls": {},
 
   ... // 拨号字段
@@ -73,6 +74,14 @@ QUIC 拥塞控制算法。
 | `reno` | New Reno |
 
 默认使用 `bbr`。
+
+#### client_random
+
+TLS ClientHello 随机数，格式为 TrustTunnel 客户端的 `prefix[/mask]`，用于连接受 `client_random_prefix` 规则限制的服务器。
+
+两部分均为十六进制编码，且仅覆盖 32 字节随机数的开头部分。掩码默认为全部位；掩码未覆盖的位以及随机数的其余部分保持随机。
+
+同时支持 HTTP/2 和 QUIC 传输。
 
 #### tls
 

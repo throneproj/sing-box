@@ -18,6 +18,7 @@ icon: material/new-box
   "health_check": true,
   "quic": false,
   "quic_congestion_control": "bbr",
+  "client_random": "a0b0/f0f0",
   "tls": {},
 
   ... // Dial Fields
@@ -73,6 +74,14 @@ QUIC congestion control algorithm.
 | `reno` | New Reno |
 
 `bbr` is used by default.
+
+#### client_random
+
+TLS ClientHello random to use, in the `prefix[/mask]` format of the TrustTunnel client, for servers restricted by `client_random_prefix` rules.
+
+Both parts are hex encoded and cover the leading bytes of the 32 byte random only. The mask defaults to all bits set; bits it leaves out, and the rest of the random, remain random.
+
+Supported by both HTTP/2 and QUIC transports.
 
 #### tls
 

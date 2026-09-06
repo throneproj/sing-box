@@ -55,6 +55,12 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if err != nil {
 		return nil, err
 	}
+	if options.ClientRandom != "" {
+		tlsConfig, err = newClientRandomConfig(tlsConfig, options)
+		if err != nil {
+			return nil, err
+		}
+	}
 	dnsRouter := service.FromContext[adapter.DNSRouter](ctx)
 	client, err := trusttunnel.NewClient(trusttunnel.ClientOptions{
 		Ctx:    ctx,
