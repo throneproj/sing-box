@@ -9,7 +9,6 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/process"
 	C "github.com/sagernet/sing-box/constant"
-	N "github.com/sagernet/sing/common/network"
 )
 
 type processCacheKey struct {
@@ -24,16 +23,17 @@ type processCacheEntry struct {
 }
 
 func (r *Router) findProcessInfoCached(ctx context.Context, network string, source netip.AddrPort, destination netip.AddrPort) (*adapter.ConnectionOwner, error) {
-	// The Windows TCP table is keyed by local address only, so the destination
-	// neither narrows the lookup nor belongs in the cache key: keeping it there
-	// just splits one process into an entry per destination.
-	if C.IsWindows && N.NetworkName(network) == N.NetworkTCP {
-		destination = netip.AddrPort{}
-	}
 	key := processCacheKey{
 		Network:     network,
 		Source:      source,
 		Destination: destination,
+	}
+	// Both Windows tables are keyed by local endpoint, so the peer never narrows a
+	// lookup and in the key only splits one process into an entry per peer -- which
+	// for UDP means a table scan per destination. The lookup itself still receives
+	// it, because the NSI keyed read needs the whole 4-tuple.
+	if C.IsWindows {
+		key.Destination = netip.AddrPort{}
 	}
 	if entry, ok := r.processCache.Get(key); ok {
 		return entry.result, entry.err
