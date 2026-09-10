@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -64,7 +65,7 @@ type NetworkManager struct {
 	interfaceUpdateRunAccess sync.Mutex
 	powerUpdateAccess        sync.Mutex
 	powerUpdateCancel        context.CancelFunc
-	started                  bool
+	started                  atomic.Bool
 }
 
 func NewNetworkManager(ctx context.Context, logger logger.ContextLogger, options option.RouteOptions, dnsOptions option.DNSOptions) (*NetworkManager, error) {
@@ -210,14 +211,16 @@ func (r *NetworkManager) Start(stage adapter.StartStage) error {
 					r.logger.Warn(E.Cause(err, "create WIFI monitor"))
 				}
 			} else {
+				r.stateAccess.Lock()
 				r.wifiMonitor = wifiMonitor
-				err = r.wifiMonitor.Start()
+				r.stateAccess.Unlock()
+				err = wifiMonitor.Start()
 				if err != nil {
 					r.logger.Warn(E.Cause(err, "start WIFI monitor"))
 				}
 			}
 		}
-		r.started = true
+		r.started.Store(true)
 	}
 	return nil
 }
@@ -470,9 +473,13 @@ func (r *NetworkManager) onWIFIStateChanged(state adapter.WIFIState) {
 }
 
 func (r *NetworkManager) UpdateWIFIState(ctx context.Context) {
+	// Published by Start while an interface update spawned during Start may already be reading it.
+	r.stateAccess.RLock()
+	wifiMonitor := r.wifiMonitor
+	r.stateAccess.RUnlock()
 	var state adapter.WIFIState
-	if r.wifiMonitor != nil {
-		state = r.wifiMonitor.ReadWIFIState(ctx)
+	if wifiMonitor != nil {
+		state = wifiMonitor.ReadWIFIState(ctx)
 	} else if r.platformInterface != nil && r.platformInterface.UsePlatformWIFIMonitor() {
 		state = r.platformInterface.ReadWIFIState(ctx)
 	} else {
@@ -525,13 +532,16 @@ func (r *NetworkManager) notifyInterfaceUpdate(defaultInterface *control.Interfa
 	if previousCancel != nil {
 		previousCancel()
 	}
+	// The monitor's first report is the network this instance was created in, and it arrives
+	// during Start; sampling here rather than in the goroutine keeps slow syscalls out of the decision.
+	resetNetwork := r.started.Load()
 	go func() {
 		defer updateCancel()
-		r.updateInterface(updateContext, defaultInterface)
+		r.updateInterface(updateContext, defaultInterface, resetNetwork)
 	}()
 }
 
-func (r *NetworkManager) updateInterface(ctx context.Context, defaultInterface *control.Interface) {
+func (r *NetworkManager) updateInterface(ctx context.Context, defaultInterface *control.Interface, resetNetwork bool) {
 	r.interfaceUpdateRunAccess.Lock()
 	defer r.interfaceUpdateRunAccess.Unlock()
 	if ctx.Err() != nil {
@@ -572,7 +582,7 @@ func (r *NetworkManager) updateInterface(ctx context.Context, defaultInterface *
 	if ctx.Err() != nil {
 		return
 	}
-	if !r.started {
+	if !resetNetwork {
 		return
 	}
 	r.ResetNetwork(ctx)
