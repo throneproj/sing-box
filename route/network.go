@@ -223,7 +223,8 @@ func (r *NetworkManager) Start(stage adapter.StartStage) error {
 			// Every monitor implementation has already delivered the initial state when Start returned:
 			// sing-tun checks routes synchronously, the Apple client blocks on the first NWPathMonitor update,
 			// and the Android client resolves the active network before setListener returns.
-			r.notifyInterfaceUpdate(r.interfaceMonitor.DefaultInterface(), 0)
+			// That state is the network this instance started in, so there is nothing to reset.
+			r.dispatchInterfaceUpdate(r.interfaceMonitor.DefaultInterface(), false)
 		}
 	}
 	return nil
@@ -521,6 +522,10 @@ func (r *NetworkManager) ResetNetwork(ctx context.Context) {
 }
 
 func (r *NetworkManager) notifyInterfaceUpdate(defaultInterface *control.Interface, flags int) {
+	r.dispatchInterfaceUpdate(defaultInterface, true)
+}
+
+func (r *NetworkManager) dispatchInterfaceUpdate(defaultInterface *control.Interface, resetNetwork bool) {
 	if defaultInterface == nil {
 		r.pauseManager.NetworkPause()
 		r.logger.Error("missing default interface")
@@ -535,10 +540,10 @@ func (r *NetworkManager) notifyInterfaceUpdate(defaultInterface *control.Interfa
 	if previousCancel != nil {
 		previousCancel()
 	}
-	go r.updateInterface(updateContext, defaultInterface)
+	go r.updateInterface(updateContext, defaultInterface, resetNetwork)
 }
 
-func (r *NetworkManager) updateInterface(ctx context.Context, defaultInterface *control.Interface) {
+func (r *NetworkManager) updateInterface(ctx context.Context, defaultInterface *control.Interface, resetNetwork bool) {
 	r.resetRunAccess.Lock()
 	defer r.resetRunAccess.Unlock()
 	if ctx.Err() != nil {
@@ -576,7 +581,7 @@ func (r *NetworkManager) updateInterface(ctx context.Context, defaultInterface *
 		return
 	}
 	r.updateNetworkEnvironment()
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || !resetNetwork {
 		return
 	}
 	r.ResetNetwork(ctx)
