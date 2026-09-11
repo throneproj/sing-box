@@ -48,6 +48,7 @@ const (
 	TypeACME               = "acme"
 	TypeCloudflareOriginCA = "cloudflare-origin-ca"
 	TypeTrustTunnel        = "trusttunnel"
+	TypeMASQUE             = "masque"
 )
 
 const (
@@ -128,6 +129,8 @@ func ProxyDisplayName(proxyType string) string {
 		return "Cloudflared"
 	case TypeTrustTunnel:
 		return "TrustTunnel"
+	case TypeMASQUE:
+		return "MASQUE"
 	case TypeSelector:
 		return "Selector"
 	case TypeURLTest:
