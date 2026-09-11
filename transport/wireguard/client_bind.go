@@ -138,9 +138,8 @@ func (c *ClientBind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint)
 	// Only strip the reserved field when the reserved-bytes feature is in use.
 	// Leaving these bytes intact otherwise keeps AmneziaWG magic headers (which
 	// occupy this region) readable on the receive path.
-	if n > 3 && c.hasReserved() {
-		b := packets[0]
-		clear(b[1:4])
+	if c.hasReserved() && hasReservedField(packets[0][:n]) {
+		clear(packets[0][1:4])
 	}
 	eps[0] = remoteEndpoint(M.SocksaddrFromNet(addr).Unwrap().AddrPort())
 	count = 1
@@ -178,7 +177,7 @@ func (c *ClientBind) Send(bufs [][]byte, ep conn.Endpoint, offset int) error {
 		if offset > 0 {
 			buf = buf[offset:]
 		}
-		if len(buf) > 3 {
+		if canSetReserved(buf) {
 			c.reservedAccess.RLock()
 			reserved, loaded := c.reservedForEndpoint[destination]
 			c.reservedAccess.RUnlock()
@@ -223,6 +222,19 @@ func (c *ClientBind) SetReservedForEndpoint(destination netip.AddrPort, reserved
 // header bytes instead.
 func (c *ClientBind) hasReserved() bool {
 	return c.reserved != [3]uint8{} || len(c.reservedForEndpoint) > 0
+}
+
+// canSetReserved reports whether b is an outgoing WireGuard message with the
+// default type header, whose zero bytes 1..3 carry the reserved value. AmneziaWG
+// junk and signature packets share the send batch and must stay untouched.
+func canSetReserved(b []byte) bool {
+	return len(b) > 3 && b[0] >= 1 && b[0] <= 4 && b[1] == 0 && b[2] == 0 && b[3] == 0
+}
+
+// hasReservedField reports whether b is an incoming WireGuard message whose
+// bytes 1..3 may carry the peer's reserved value.
+func hasReservedField(b []byte) bool {
+	return len(b) > 3 && b[0] >= 1 && b[0] <= 4
 }
 
 type wireConn struct {
