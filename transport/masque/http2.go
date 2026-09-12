@@ -46,9 +46,10 @@ func DialHTTP2(ctx context.Context, lifetime context.Context, dialer N.Dialer, d
 		tcpConn.Close()
 		return nil, err
 	}
-	if protocol := tlsConn.ConnectionState().NegotiatedProtocol; protocol != http2.NextProtoTLS {
+	// Cloudflare's MASQUE edge completes TLS without selecting any ALPN protocol.
+	if protocol := tlsConn.ConnectionState().NegotiatedProtocol; protocol != "" && protocol != http2.NextProtoTLS {
 		tlsConn.Close()
-		return nil, E.New("server did not negotiate HTTP/2 (ALPN: ", protocol, ")")
+		return nil, E.New("server negotiated ", protocol, " instead of HTTP/2")
 	}
 	clientConn, err := h2Transport.NewClientConn(tlsConn)
 	if err != nil {
