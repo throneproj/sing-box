@@ -78,13 +78,13 @@ func (e *Endpoint) serve(ctx context.Context) (time.Duration, error) {
 		conn.Close()
 		return 0, ctx.Err()
 	}
-	e.conn = conn
+	e.setConnLocked(conn)
 	e.access.Unlock()
 	connectedAt := time.Now()
 	err = e.readPackets(conn)
 	e.access.Lock()
 	if e.conn == conn {
-		e.conn = nil
+		e.clearConnLocked()
 	}
 	e.access.Unlock()
 	conn.Close()
@@ -181,7 +181,39 @@ func (e *Endpoint) currentConn() masquetransport.Conn {
 	return e.conn
 }
 
+func (e *Endpoint) setConnLocked(conn masquetransport.Conn) {
+	e.conn = conn
+	close(e.ready)
+}
+
+func (e *Endpoint) clearConnLocked() {
+	if e.conn == nil {
+		return
+	}
+	e.conn = nil
+	e.ready = make(chan struct{})
+}
+
+// Best effort: a packet sent before the carrier is up is dropped, costing a TCP retransmit backoff.
+func (e *Endpoint) waitReady(ctx context.Context) {
+	e.access.Lock()
+	ready := e.ready
+	e.access.Unlock()
+	timer := time.NewTimer(C.TCPConnectTimeout)
+	defer timer.Stop()
+	select {
+	case <-ready:
+	case <-ctx.Done():
+	case <-e.loopContext.Done():
+	case <-timer.C:
+	}
+}
+
 func (e *Endpoint) WritePackets(packets [][]byte) error {
+	err := e.ensureStarted()
+	if err != nil {
+		return err
+	}
 	conn := e.currentConn()
 	if conn == nil {
 		return E.New("endpoint is not ready yet")
@@ -222,7 +254,7 @@ func (e *Endpoint) writePacket(conn masquetransport.Conn, packet []byte) error {
 	e.access.Lock()
 	isCurrent := e.conn == conn
 	if isCurrent {
-		e.conn = nil
+		e.clearConnLocked()
 	}
 	e.access.Unlock()
 	if isCurrent {

@@ -74,9 +74,13 @@ type Endpoint struct {
 	preferHTTP2     bool
 	localAddresses  []netip.Prefix
 	mtu             uint32
+	system          bool
 	device          ovpntransport.Device
+	startOnce       sync.Once
+	startErr        error
 	access          sync.Mutex
 	conn            masquetransport.Conn
+	ready           chan struct{}
 	cancelConnect   context.CancelFunc
 	loopDone        chan struct{}
 }
@@ -232,6 +236,8 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		preferHTTP2:     !useHTTP3,
 		localAddresses:  options.Address,
 		mtu:             mtu,
+		system:          options.System,
+		ready:           make(chan struct{}),
 	}
 	device, err := ovpntransport.NewDevice(ovpntransport.DeviceOptions{
 		Context:         ctx,
@@ -261,26 +267,43 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 }
 
 func (e *Endpoint) Start(stage adapter.StartStage) error {
-	if stage != adapter.StartStatePostStart {
+	// Dials during preStart (rule-set downloads, DNS) happen before PostStart, so the carrier comes up on first use.
+	if stage != adapter.StartStatePostStart || !e.system {
 		return nil
 	}
-	err := e.device.Start()
-	if err != nil {
-		return E.Cause(err, "start device")
-	}
-	loopDone := make(chan struct{})
-	e.access.Lock()
-	e.loopDone = loopDone
-	e.access.Unlock()
-	go e.loop(loopDone)
-	return nil
+	// OS-routed traffic enters a system device without passing a dial hook.
+	return e.ensureStarted()
+}
+
+func (e *Endpoint) ensureStarted() error {
+	e.startOnce.Do(func() {
+		if e.loopContext.Err() != nil {
+			e.startErr = net.ErrClosed
+			return
+		}
+		err := e.device.Start()
+		if err != nil {
+			e.startErr = E.Cause(err, "start device")
+			return
+		}
+		loopDone := make(chan struct{})
+		e.access.Lock()
+		e.loopDone = loopDone
+		e.access.Unlock()
+		go e.loop(loopDone)
+	})
+	return e.startErr
 }
 
 func (e *Endpoint) Close() error {
 	e.cancelLoop()
+	// Waits out an in-flight ensureStarted and keeps any later one from starting the device or loop.
+	e.startOnce.Do(func() {
+		e.startErr = net.ErrClosed
+	})
 	e.access.Lock()
 	conn := e.conn
-	e.conn = nil
+	e.clearConnLocked()
 	loopDone := e.loopDone
 	e.access.Unlock()
 	if conn != nil {
@@ -296,7 +319,7 @@ func (e *Endpoint) Close() error {
 func (e *Endpoint) InterfaceUpdated(ctx context.Context) {
 	e.access.Lock()
 	conn := e.conn
-	e.conn = nil
+	e.clearConnLocked()
 	cancelConnect := e.cancelConnect
 	e.access.Unlock()
 	if cancelConnect != nil {
@@ -308,6 +331,11 @@ func (e *Endpoint) InterfaceUpdated(ctx context.Context) {
 }
 
 func (e *Endpoint) PreMatchFlow(network string, destination netip.Addr) adapter.PreMatchAction {
+	err := e.ensureStarted()
+	if err != nil {
+		e.logger.Error(E.Cause(err, "start MASQUE"))
+		return adapter.PreMatchContinue
+	}
 	return adapter.PreMatchFlow
 }
 
@@ -401,6 +429,11 @@ func (e *Endpoint) DialContext(ctx context.Context, network string, destination 
 	case N.NetworkUDP:
 		e.logger.InfoContext(ctx, "outbound packet connection to ", destination)
 	}
+	err := e.ensureStarted()
+	if err != nil {
+		return nil, err
+	}
+	e.waitReady(ctx)
 	if destination.IsDomain() {
 		destinationAddresses, err := e.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
 		if err != nil {
@@ -416,6 +449,11 @@ func (e *Endpoint) DialContext(ctx context.Context, network string, destination 
 
 func (e *Endpoint) ListenPacketWithDestination(ctx context.Context, destination M.Socksaddr) (net.PacketConn, netip.Addr, error) {
 	e.logger.InfoContext(ctx, "outbound packet connection to ", destination)
+	err := e.ensureStarted()
+	if err != nil {
+		return nil, netip.Addr{}, err
+	}
+	e.waitReady(ctx)
 	if destination.IsDomain() {
 		destinationAddresses, err := e.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
 		if err != nil {
