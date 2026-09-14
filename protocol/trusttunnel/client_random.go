@@ -18,29 +18,29 @@ const clientRandomLength = 32
 // clientRandomConfig makes every new TLS or QUIC connection send a ClientHello
 // random matching the client_random prefix and mask required by the server.
 //
-// crypto/tls takes the ClientHello random from Config.Rand, so the prefix is
-// applied by cloning the TLS config per connection and replacing its entropy
-// source. Bits outside the mask, and every later read, stay untouched.
+// crypto/tls and uTLS take the ClientHello random from the config's entropy
+// source, so every connection gets its own clientRandomReader.
 type clientRandomConfig struct {
 	tls.Config
 	prefix []byte
 	mask   []byte
 }
 
-func newClientRandomConfig(config tls.Config, options option.TrustTunnelOutboundOptions) (tls.Config, error) {
-	if options.TLS.ECH != nil && options.TLS.ECH.Enabled {
+func newClientRandomConfig(config tls.Config, clientRandom string, tlsOptions option.OutboundTLSOptions) (tls.Config, error) {
+	if tlsOptions.ECH != nil && tlsOptions.ECH.Enabled {
 		// The random of the inner ClientHello is not the one sent on the wire.
 		return nil, E.New("client_random is not compatible with ECH")
 	}
-	prefix, mask, err := parseClientRandom(options.ClientRandom)
+	if tlsOptions.UTLS != nil && tlsOptions.UTLS.Enabled && tlsOptions.UTLS.Fingerprint == "custom" {
+		// The padded ClientHello is rebuilt with a fresh random during the handshake.
+		return nil, E.New("client_random is not compatible with the custom uTLS fingerprint")
+	}
+	if _, isRandCapable := config.(tls.RandCapableConfig); !isRandCapable {
+		return nil, E.New("client_random is not compatible with REALITY or the system TLS engines")
+	}
+	prefix, mask, err := parseClientRandom(clientRandom)
 	if err != nil {
 		return nil, err
-	}
-	// uTLS and REALITY build their own ClientHello and reject STDConfig, fail
-	// here instead of on the first connection.
-	_, err = config.STDConfig()
-	if err != nil {
-		return nil, E.Cause(err, "client_random")
 	}
 	return &clientRandomConfig{
 		Config: config,
@@ -50,19 +50,19 @@ func newClientRandomConfig(config tls.Config, options option.TrustTunnelOutbound
 }
 
 func (c *clientRandomConfig) Client(conn net.Conn) (tls.Conn, error) {
-	config, _, err := c.cloneWithRandom()
-	if err != nil {
-		return nil, err
-	}
-	return config.Client(conn)
+	return c.Config.(tls.RandCapableConfig).ClientWithRand(conn, c.newReader())
 }
 
 // STDConfig returns a fresh standard config for every caller. sing-quic calls
-// this method once per dial, so each QUIC connection gets its own reader and
-// applies the prefix independently.
+// this method once per dial, so each QUIC connection gets its own reader.
 func (c *clientRandomConfig) STDConfig() (*tls.STDConfig, error) {
-	_, stdConfig, err := c.cloneWithRandom()
-	return stdConfig, err
+	stdConfig, err := c.Config.STDConfig()
+	if err != nil {
+		return nil, err
+	}
+	stdConfig = stdConfig.Clone()
+	stdConfig.Rand = c.newReader()
+	return stdConfig, nil
 }
 
 func (c *clientRandomConfig) Clone() tls.Config {
@@ -73,42 +73,30 @@ func (c *clientRandomConfig) Clone() tls.Config {
 	}
 }
 
-func (c *clientRandomConfig) cloneWithRandom() (tls.Config, *tls.STDConfig, error) {
-	config := c.Config.Clone()
-	stdConfig, err := config.STDConfig()
-	if err != nil {
-		return nil, nil, err
-	}
-	stdConfig.Rand = &clientRandomReader{prefix: c.prefix, mask: c.mask}
-	return config, stdConfig, nil
+func (c *clientRandomConfig) newReader() *clientRandomReader {
+	return &clientRandomReader{prefix: c.prefix, mask: c.mask}
 }
 
-// parseClientRandom parses the TrustTunnel `prefix[/mask]` syntax. Both parts
-// are hex encoded, the mask defaults to all bits set and covers the leading
-// bytes of the prefix only.
+// parseClientRandom parses the TrustTunnel prefix[/mask] hex syntax, an omitted
+// mask sets every bit of the prefix.
 func parseClientRandom(clientRandom string) (prefix []byte, mask []byte, err error) {
 	prefixString, maskString, hasMask := strings.Cut(clientRandom, "/")
 	prefix, err = hex.DecodeString(prefixString)
 	if err != nil {
 		return nil, nil, E.Cause(err, "decode client_random prefix")
 	}
-	if len(prefix) == 0 {
-		return nil, nil, E.New("empty client_random prefix")
+	if len(prefix) == 0 || len(prefix) > clientRandomLength {
+		return nil, nil, E.New("client_random prefix must be 1 to ", clientRandomLength, " bytes")
 	}
-	if len(prefix) > clientRandomLength {
-		return nil, nil, E.New("client_random prefix too long: ", len(prefix), " bytes")
+	if !hasMask {
+		return prefix, bytes.Repeat([]byte{0xFF}, len(prefix)), nil
 	}
-	mask = bytes.Repeat([]byte{0xFF}, len(prefix))
-	if hasMask {
-		var maskBytes []byte
-		maskBytes, err = hex.DecodeString(maskString)
-		if err != nil {
-			return nil, nil, E.Cause(err, "decode client_random mask")
-		}
-		if len(maskBytes) == 0 {
-			return nil, nil, E.New("empty client_random mask")
-		}
-		copy(mask, maskBytes)
+	mask, err = hex.DecodeString(maskString)
+	if err != nil {
+		return nil, nil, E.Cause(err, "decode client_random mask")
+	}
+	if len(mask) != len(prefix) {
+		return nil, nil, E.New("client_random mask must be as long as the prefix")
 	}
 	return prefix, mask, nil
 }

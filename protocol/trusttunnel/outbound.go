@@ -56,7 +56,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, err
 	}
 	if options.ClientRandom != "" {
-		tlsConfig, err = newClientRandomConfig(tlsConfig, options)
+		tlsConfig, err = newClientRandomConfig(tlsConfig, options.ClientRandom, *options.TLS)
 		if err != nil {
 			return nil, err
 		}
@@ -92,6 +92,13 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		client:    client,
 		dnsRouter: dnsRouter,
 	}, nil
+}
+
+func (h *Outbound) Start(stage adapter.StartStage) error {
+	if stage != adapter.StartStateStart {
+		return nil
+	}
+	return h.client.Start()
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
