@@ -15,6 +15,14 @@ import (
 )
 
 func TestTrustTunnelQUICSelf(t *testing.T) {
+	testTrustTunnelQUICSelf(t, "")
+}
+
+func TestTrustTunnelClientRandomQUICSelf(t *testing.T) {
+	testTrustTunnelQUICSelf(t, "a0b0/f0f0")
+}
+
+func testTrustTunnelQUICSelf(t *testing.T, clientRandom string) {
 	caPem, certPem, keyPem := createSelfSignedCertificate(t, "example.org")
 	startInstance(t, option.Options{
 		Inbounds: []option.Inbound{
@@ -67,9 +75,10 @@ func TestTrustTunnelQUICSelf(t *testing.T) {
 						Server:     "127.0.0.1",
 						ServerPort: serverPort,
 					},
-					Username: "sekai",
-					Password: "password",
-					QUIC:     true,
+					Username:     "sekai",
+					Password:     "password",
+					QUIC:         true,
+					ClientRandom: clientRandom,
 					OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{
 						TLS: &option.OutboundTLSOptions{
 							Enabled:         true,
