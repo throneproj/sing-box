@@ -6,16 +6,18 @@ import (
 	stdTLS "crypto/tls"
 	"encoding/hex"
 	"io"
-	"net"
 	"testing"
 
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/logger"
 
 	"github.com/stretchr/testify/require"
 )
+
+const testClientRandom = "a0b0/f0f0"
 
 func TestClientRandomOptionDecode(t *testing.T) {
 	t.Parallel()
@@ -65,18 +67,6 @@ func TestParseClientRandom(t *testing.T) {
 			mask:   "f0f0",
 		},
 		{
-			name:   "short mask",
-			value:  "aabbcc/ff",
-			prefix: "aabbcc",
-			mask:   "ffffff",
-		},
-		{
-			name:   "long mask",
-			value:  "aabb/f0f0f0",
-			prefix: "aabb",
-			mask:   "f0f0",
-		},
-		{
 			name:   "upper case",
 			value:  "AABB",
 			prefix: "aabb",
@@ -110,6 +100,8 @@ func TestParseClientRandomInvalid(t *testing.T) {
 		{name: "not hex", value: "zzzz"},
 		{name: "mask not hex", value: "aabb/zzzz"},
 		{name: "empty mask", value: "aabb/"},
+		{name: "short mask", value: "aabbcc/ff"},
+		{name: "long mask", value: "aabb/f0f0f0"},
 		{name: "empty prefix", value: "/ffff"},
 		{name: "empty prefix and mask", value: "/"},
 		{name: "too long", value: hex.EncodeToString(bytes.Repeat([]byte{0xAA}, 33))},
@@ -149,7 +141,7 @@ func TestClientRandomReaderAppliesOnce(t *testing.T) {
 
 func TestClientRandomReaderKeepsUnmaskedBits(t *testing.T) {
 	t.Parallel()
-	prefix, mask, err := parseClientRandom("a0b0/f0f0")
+	prefix, mask, err := parseClientRandom(testClientRandom)
 	require.NoError(t, err)
 	values := make(map[string]bool)
 	for range 64 {
@@ -166,23 +158,17 @@ func TestClientRandomReaderKeepsUnmaskedBits(t *testing.T) {
 
 func TestClientRandomClientHello(t *testing.T) {
 	t.Parallel()
-	prefix, mask, err := parseClientRandom("a0b0/f0f0")
+	prefix, mask, err := parseClientRandom(testClientRandom)
 	require.NoError(t, err)
-	tlsConfig := newTestTLSConfig(t)
-	config, err := newClientRandomConfig(tlsConfig, option.TrustTunnelOutboundOptions{
-		ClientRandom: "a0b0/f0f0",
-		OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{
-			TLS: &option.OutboundTLSOptions{Enabled: true},
-		},
-	})
+	tlsConfig := newTestTLSConfig(t, option.OutboundTLSOptions{})
+	config, err := newClientRandomConfig(tlsConfig, testClientRandom, option.OutboundTLSOptions{})
 	require.NoError(t, err)
 	randoms := make(map[string]bool)
 	for range 8 {
-		random := captureClientHelloRandom(t, config)
+		random := clientHelloRandom(captureClientHello(t, config))
 		requireMatchesClientRandom(t, prefix, mask, random)
 		randoms[string(random)] = true
 	}
-	// Every connection generates its own random.
 	require.Len(t, randoms, 8)
 	// The entropy source is replaced on a copy, the wrapped config is untouched.
 	stdConfig, err := tlsConfig.STDConfig()
@@ -190,17 +176,26 @@ func TestClientRandomClientHello(t *testing.T) {
 	require.Nil(t, stdConfig.Rand)
 }
 
+func TestClientRandomKeepsServerNameCase(t *testing.T) {
+	t.Parallel()
+	tlsConfig := newTestTLSConfig(t, option.OutboundTLSOptions{
+		TLSTricks: &option.TLSTricksOptions{MixedCaseSNI: true},
+	})
+	stdConfig, err := tlsConfig.STDConfig()
+	require.NoError(t, err)
+	serverName := []byte(stdConfig.ServerName)
+	config, err := newClientRandomConfig(tlsConfig, testClientRandom, option.OutboundTLSOptions{})
+	require.NoError(t, err)
+	for range 8 {
+		require.True(t, bytes.Contains(captureClientHello(t, config), serverName))
+	}
+}
+
 func TestClientRandomQUICClientHello(t *testing.T) {
 	t.Parallel()
-	prefix, mask, err := parseClientRandom("a0b0/f0f0")
+	prefix, mask, err := parseClientRandom(testClientRandom)
 	require.NoError(t, err)
-	config, err := newClientRandomConfig(newTestTLSConfig(t), option.TrustTunnelOutboundOptions{
-		ClientRandom: "a0b0/f0f0",
-		QUIC:         true,
-		OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{
-			TLS: &option.OutboundTLSOptions{Enabled: true},
-		},
-	})
+	config, err := newClientRandomConfig(newTestTLSConfig(t, option.OutboundTLSOptions{}), testClientRandom, option.OutboundTLSOptions{})
 	require.NoError(t, err)
 	config.SetNextProtos([]string{"h3"})
 
@@ -220,18 +215,34 @@ func TestClientRandomQUICClientHello(t *testing.T) {
 	require.Len(t, randoms, 8)
 }
 
-func TestNewClientRandomConfigECHUnsupported(t *testing.T) {
+func TestNewClientRandomConfigIncompatible(t *testing.T) {
 	t.Parallel()
-	_, err := newClientRandomConfig(newTestTLSConfig(t), option.TrustTunnelOutboundOptions{
-		ClientRandom: "aabb",
-		OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{
-			TLS: &option.OutboundTLSOptions{
-				Enabled: true,
-				ECH:     &option.OutboundECHOptions{Enabled: true},
-			},
+	for _, testCase := range []struct {
+		name       string
+		config     tls.Config
+		tlsOptions option.OutboundTLSOptions
+	}{
+		{
+			name:       "ECH",
+			config:     newTestTLSConfig(t, option.OutboundTLSOptions{}),
+			tlsOptions: option.OutboundTLSOptions{ECH: &option.OutboundECHOptions{Enabled: true}},
 		},
-	})
-	require.Error(t, err)
+		{
+			name:       "custom uTLS fingerprint",
+			config:     newTestTLSConfig(t, option.OutboundTLSOptions{}),
+			tlsOptions: option.OutboundTLSOptions{UTLS: &option.OutboundUTLSOptions{Enabled: true, Fingerprint: "custom"}},
+		},
+		{
+			name:   "no custom entropy",
+			config: struct{ tls.Config }{newTestTLSConfig(t, option.OutboundTLSOptions{})},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := newClientRandomConfig(testCase.config, testClientRandom, testCase.tlsOptions)
+			require.Error(t, err)
+		})
+	}
 }
 
 func requireMatchesClientRandom(t *testing.T, prefix []byte, mask []byte, random []byte) {
@@ -242,35 +253,33 @@ func requireMatchesClientRandom(t *testing.T, prefix []byte, mask []byte, random
 	}
 }
 
-func newTestTLSConfig(t *testing.T) tls.Config {
+func newTestTLSConfig(t *testing.T, options option.OutboundTLSOptions) tls.Config {
 	t.Helper()
-	config, err := tls.NewClient(context.Background(), logger.NOP(), "example.org", option.OutboundTLSOptions{
-		Enabled:    true,
-		ServerName: "example.org",
-	})
+	options.Enabled = true
+	options.ServerName = "example.org"
+	config, err := tls.NewClient(context.Background(), logger.NOP(), "example.org", options)
 	require.NoError(t, err)
 	return config
 }
 
-// captureClientHelloRandom runs the client side of a TLS handshake against a
-// pipe and returns the random of the ClientHello it sent.
-func captureClientHelloRandom(t *testing.T, config tls.Config) []byte {
+// captureClientHello runs the client side of a handshake against a write-only
+// conn and returns the ClientHello record it sent.
+func captureClientHello(t *testing.T, config tls.Config) []byte {
 	t.Helper()
-	clientPipe, serverPipe := net.Pipe()
-	defer clientPipe.Close()
-	defer serverPipe.Close()
-	tlsConn, err := config.Client(clientPipe)
+	var buffer bytes.Buffer
+	tlsConn, err := config.Client(bufio.NewWriteOnlyConn(&buffer))
 	require.NoError(t, err)
-	go func() {
-		_ = tlsConn.HandshakeContext(context.Background())
-	}()
-	// Record header, handshake header, legacy version, random.
-	clientHello := make([]byte, 5+4+2+clientRandomLength)
-	_, err = io.ReadFull(serverPipe, clientHello)
-	require.NoError(t, err)
+	_ = tlsConn.HandshakeContext(context.Background())
+	clientHello := buffer.Bytes()
+	require.Greater(t, len(clientHello), 5+4+2+clientRandomLength)
 	require.Equal(t, byte(0x16), clientHello[0], "handshake record")
 	require.Equal(t, byte(0x01), clientHello[5], "client hello")
-	return clientHello[11:]
+	return clientHello
+}
+
+// clientHelloRandom skips the record header, handshake header and legacy version.
+func clientHelloRandom(clientHello []byte) []byte {
+	return clientHello[5+4+2 : 5+4+2+clientRandomLength]
 }
 
 func captureQUICClientHelloRandom(t *testing.T, config *stdTLS.Config) []byte {
