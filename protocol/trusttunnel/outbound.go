@@ -55,6 +55,12 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if err != nil {
 		return nil, err
 	}
+	if options.CustomSNI != "" {
+		err = setCustomSNI(tlsConfig, options.CustomSNI, *options.TLS)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if options.ClientRandom != "" {
 		tlsConfig, err = newClientRandomConfig(tlsConfig, options.ClientRandom, *options.TLS)
 		if err != nil {
