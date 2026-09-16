@@ -204,4 +204,4 @@ require (
 
 replace github.com/sagernet/wireguard-go => github.com/throneproj/wireguard-go v0.0.0-20260911164435-b311c8ac53ae
 
-replace github.com/sagernet/sing => github.com/throneproj/sing v0.9.4-0.20260909013934-6ba2d76a691b
+replace github.com/sagernet/sing => github.com/throneproj/sing v0.9.4-0.20260916175432-016a6aa8f2bc
