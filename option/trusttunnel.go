@@ -20,6 +20,7 @@ type TrustTunnelOutboundOptions struct {
 	HealthCheck           bool   `json:"health_check,omitempty"`
 	QUIC                  bool   `json:"quic,omitempty"`
 	QUICCongestionControl string `json:"quic_congestion_control,omitempty"`
+	CustomSNI             string `json:"custom_sni,omitempty"`
 	ClientRandom          string `json:"client_random,omitempty"`
 	OutboundTLSOptionsContainer
 }
