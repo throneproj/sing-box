@@ -175,6 +175,11 @@ func (s *Source) Configuration() *Config {
 		return s.config
 	}
 	config := systemInfo.build(interfaceIndex)
+	var myInterfaces []string
+	if s.interfaceMonitor != nil {
+		myInterfaces = s.interfaceMonitor.MyInterfaces()
+	}
+	replaceOwnTunServers(config, interfaceIndex, myInterfaces)
 	if s.config != nil && config.Equal(s.config) {
 		return s.config
 	}
