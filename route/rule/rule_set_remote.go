@@ -29,7 +29,7 @@ import (
 	"go4.org/netipx"
 )
 
-var _ adapter.RuleSet = (*RemoteRuleSet)(nil)
+var _ adapter.UpdatableRuleSet = (*RemoteRuleSet)(nil)
 
 type RemoteRuleSet struct {
 	ctx            context.Context
@@ -44,6 +44,7 @@ type RemoteRuleSet struct {
 	updateInterval time.Duration
 	httpClient     *http.Client
 	content        atomic.Pointer[ruleSetContent]
+	updateAccess   chan struct{}
 	lastUpdated    time.Time
 	lastEtag       string
 	cacheFile      adapter.CacheFile
@@ -78,6 +79,7 @@ func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, tag stri
 		initialPath:    initialPath,
 		options:        options,
 		updateInterval: updateInterval,
+		updateAccess:   make(chan struct{}, 1),
 		pauseManager:   service.FromContext[pause.Manager](ctx),
 	}
 	ruleSet.content.Store(&ruleSetContent{})
@@ -224,12 +226,39 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
 }
 
 func (s *RemoteRuleSet) updateOnce() {
-	err := s.fetch(s.ctx, false)
+	err := s.Update(s.ctx)
 	if err != nil {
 		s.logger.Error("fetch rule-set ", s.tag, ": ", err)
-	} else {
-		s.Cleanup()
 	}
+}
+
+func (s *RemoteRuleSet) Update(ctx context.Context) error {
+	select {
+	case s.updateAccess <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	}
+	defer func() {
+		<-s.updateAccess
+	}()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(s.ctx, cancel)
+	defer stop()
+	err := s.fetch(ctx, false)
+	if err != nil {
+		return err
+	}
+	s.Cleanup()
+	return nil
+}
+
+func (s *RemoteRuleSet) LastUpdated() time.Time {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return s.lastUpdated
 }
 
 func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
@@ -238,8 +267,11 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
 	if err != nil {
 		return err
 	}
-	if s.lastEtag != "" {
-		request.Header.Set("If-None-Match", s.lastEtag)
+	s.access.Lock()
+	lastEtag := s.lastEtag
+	s.access.Unlock()
+	if lastEtag != "" {
+		request.Header.Set("If-None-Match", lastEtag)
 	}
 	if !isStart {
 		defer s.httpClient.CloseIdleConnections()
@@ -252,11 +284,14 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
 	switch response.StatusCode {
 	case http.StatusOK:
 	case http.StatusNotModified:
-		s.lastUpdated = time.Now()
+		lastUpdated := time.Now()
+		s.access.Lock()
+		s.lastUpdated = lastUpdated
+		s.access.Unlock()
 		if s.cacheFile != nil {
 			savedRuleSet := s.cacheFile.LoadRuleSet(s.tag)
 			if savedRuleSet != nil {
-				savedRuleSet.LastUpdated = s.lastUpdated
+				savedRuleSet.LastUpdated = lastUpdated
 				savedRuleSet.URLHash = s.urlHash[:]
 				err = s.cacheFile.SaveRuleSet(s.tag, savedRuleSet)
 				if err != nil {
@@ -280,14 +315,18 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
 	}
 	eTagHeader := response.Header.Get("Etag")
 	if eTagHeader != "" {
-		s.lastEtag = eTagHeader
+		lastEtag = eTagHeader
 	}
-	s.lastUpdated = time.Now()
+	lastUpdated := time.Now()
+	s.access.Lock()
+	s.lastEtag = lastEtag
+	s.lastUpdated = lastUpdated
+	s.access.Unlock()
 	if s.cacheFile != nil {
 		err = s.cacheFile.SaveRuleSet(s.tag, &adapter.SavedBinary{
-			LastUpdated: s.lastUpdated,
+			LastUpdated: lastUpdated,
 			Content:     content,
-			LastEtag:    s.lastEtag,
+			LastEtag:    lastEtag,
 			URLHash:     s.urlHash[:],
 		})
 		if err != nil {
