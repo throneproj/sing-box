@@ -40,6 +40,10 @@ icon: material/new-box
 
 ### 字段
 
+!!! note "macOS"
+
+    当默认接口的系统解析器指向由此 sing-box 实例创建的 tun 接口（例如客户端将系统 DNS 重定向到该接口后）时，改用默认接口 DHCP 租约中的服务器（`ipconfig getsummary`）。
+
 #### prefer_go
 
 !!! question "自 sing-box 1.13.0 起"
