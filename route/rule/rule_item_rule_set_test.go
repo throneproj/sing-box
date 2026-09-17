@@ -45,6 +45,11 @@ func (r *ruleSetItemTestRouter) RuleSet(tag string) (adapter.RuleSet, bool) {
 	ruleSet, loaded := r.ruleSets[tag]
 	return ruleSet, loaded
 }
+
+func (r *ruleSetItemTestRouter) RuleSets() []adapter.RuleSet {
+	return nil
+}
+
 func (r *ruleSetItemTestRouter) Rules() []adapter.Rule                      { return nil }
 func (r *ruleSetItemTestRouter) NeedFindProcess() bool                      { return false }
 func (r *ruleSetItemTestRouter) NeedFindNeighbor() bool                     { return false }
