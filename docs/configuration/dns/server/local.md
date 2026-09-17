@@ -40,6 +40,10 @@ icon: material/new-box
 
 ### Fields
 
+!!! note "macOS"
+
+    When the system resolver of the default interface points at the tun interface created by this sing-box instance (e.g. after the client redirected the system DNS to it), the servers from the DHCP lease of the default interface (`ipconfig getsummary`) are used instead.
+
 #### prefer_go
 
 !!! question "Since sing-box 1.13.0"
