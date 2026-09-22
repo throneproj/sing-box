@@ -27,6 +27,6 @@ func TestOutboundStartsHealthCheck(t *testing.T) {
 	outbound := &Outbound{client: client}
 	require.NoError(t, outbound.Start(adapter.StartStateStart))
 	// Both touch the health check timer, which panics unless the client was started.
-	outbound.InterfaceUpdated()
+	outbound.InterfaceUpdated(t.Context())
 	require.NoError(t, outbound.Close())
 }
