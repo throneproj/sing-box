@@ -30,6 +30,8 @@ func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.TrustTunnelOutboundOptions](registry, C.TypeTrustTunnel, NewOutbound)
 }
 
+var _ adapter.InterfaceUpdateListener = (*Outbound)(nil)
+
 type Outbound struct {
 	outbound.Adapter
 	ctx       context.Context
@@ -148,6 +150,6 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	return h.client.ListenPacket(ctx)
 }
 
-func (h *Outbound) InterfaceUpdated() {
+func (h *Outbound) InterfaceUpdated(ctx context.Context) {
 	h.client.ResetConnections()
 }

@@ -29,6 +29,6 @@ func TestOutboundStartsHealthCheck(t *testing.T) {
 	scope := adapter.NewScope(t.Context(), log.NewNOPFactory().Logger())
 	require.NoError(t, outbound.Start(adapter.StartStateStart, scope))
 	// Both touch the health check timer, which panics unless the client was started.
-	outbound.InterfaceUpdated()
+	outbound.InterfaceUpdated(t.Context())
 	require.NoError(t, scope.Close())
 }
