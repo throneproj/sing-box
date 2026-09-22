@@ -8,6 +8,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/process"
+	C "github.com/sagernet/sing-box/constant"
 )
 
 type processCacheKey struct {
@@ -26,6 +27,10 @@ func (r *Router) findProcessInfoCached(ctx context.Context, network string, sour
 		Network:     network,
 		Source:      source,
 		Destination: destination,
+	}
+	// Windows sockets are owned per local endpoint; the peer is only needed by the keyed TCP lookup.
+	if C.IsWindows {
+		key.Destination = netip.AddrPort{}
 	}
 	if entry, ok := r.processCache.Get(key); ok {
 		return entry.result, entry.err
