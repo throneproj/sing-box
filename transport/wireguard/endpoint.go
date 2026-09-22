@@ -174,15 +174,18 @@ func (e *Endpoint) Start(postStart bool) error {
 	} else {
 		var (
 			isConnect   bool
-			connectAddr netip.AddrPort
+			connectAddr M.Socksaddr
 			reserved    [3]uint8
 		)
 		if len(e.peers) == 1 {
 			reserved = e.peers[0].reserved
 			if e.peers[0].endpoint.IsValid() {
-				isConnect = true
-				connectAddr = e.peers[0].endpoint
+				connectAddr = M.SocksaddrFromNetIP(e.peers[0].endpoint)
+			} else {
+				// Detours may bind UDP to the ListenPacket destination, so a domain peer is dialed and resolved per connect.
+				connectAddr = e.peers[0].destination
 			}
+			isConnect = connectAddr.IsValid()
 		}
 		bind = NewClientBind(e.options.Context, e.options.Logger, e.options.Dialer, isConnect, connectAddr, reserved)
 	}
