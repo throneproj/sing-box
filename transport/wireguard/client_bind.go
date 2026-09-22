@@ -33,11 +33,11 @@ type ClientBind struct {
 	conn                *wireConn
 	done                chan struct{}
 	isConnect           bool
-	connectAddr         netip.AddrPort
+	connectAddr         M.Socksaddr
 	reserved            [3]uint8
 }
 
-func NewClientBind(ctx context.Context, logger logger.Logger, dialer N.Dialer, isConnect bool, connectAddr netip.AddrPort, reserved [3]uint8) *ClientBind {
+func NewClientBind(ctx context.Context, logger logger.Logger, dialer N.Dialer, isConnect bool, connectAddr M.Socksaddr, reserved [3]uint8) *ClientBind {
 	return &ClientBind{
 		ctx:                 ctx,
 		logger:              logger,
@@ -78,7 +78,7 @@ func (c *ClientBind) connect() (*wireConn, error) {
 		}
 	}
 	if c.isConnect {
-		udpConn, err := c.dialer.DialContext(c.bindCtx, N.NetworkUDP, M.SocksaddrFromNetIP(c.connectAddr))
+		udpConn, err := c.dialer.DialContext(c.bindCtx, N.NetworkUDP, c.connectAddr)
 		if err != nil {
 			return nil, err
 		}
