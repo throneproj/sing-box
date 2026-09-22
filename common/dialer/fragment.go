@@ -33,8 +33,8 @@ type fragmentConn struct {
 
 // isClientHelloPacket checks if data resembles a TLS clientHello packet
 func isClientHelloPacket(b []byte) bool {
-	// Check if the packet is at least 5 bytes long and the content type is 22 (TLS handshake)
-	if len(b) < 5 || b[0] != 22 {
+	// Check if the packet reaches the handshake type byte and the content type is 22 (TLS handshake)
+	if len(b) < 6 || b[0] != 22 {
 		return false
 	}
 
