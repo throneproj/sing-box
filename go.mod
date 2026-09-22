@@ -202,6 +202,6 @@ require (
 	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
 )
 
-replace github.com/sagernet/wireguard-go => github.com/throneproj/wireguard-go v0.0.8-0.20260922015959-c9380bb0c37c
+replace github.com/sagernet/wireguard-go => github.com/throneproj/wireguard-go v0.0.0-20260922015959-c9380bb0c37c
 
-replace github.com/sagernet/sing => github.com/throneproj/sing v0.9.6-0.20260922020918-4e0ee1952d35
+replace github.com/sagernet/sing => github.com/throneproj/sing v0.9.4-0.20260922020918-4e0ee1952d35
