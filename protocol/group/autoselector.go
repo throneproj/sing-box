@@ -33,6 +33,7 @@ var (
 	_ adapter.URLTestGroup            = (*AutoSelector)(nil)
 	_ adapter.ConnectionHandler       = (*AutoSelector)(nil)
 	_ adapter.PacketConnectionHandler = (*AutoSelector)(nil)
+	_ adapter.InterfaceUpdateListener = (*AutoSelector)(nil)
 )
 
 const (
@@ -596,6 +597,26 @@ func (s *AutoSelector) requestRound() {
 	}
 }
 
+// InterfaceUpdated pulls an urgent round forward when the default network changes or the platform resets it:
+// health measured on the previous network says little about this one. Not debounced like requestRound, since a
+// kick that landed just before the change probed the old network. While suspended, recovery watches the network.
+func (s *AutoSelector) InterfaceUpdated(_ context.Context) {
+	if s.pause.IsPaused() {
+		return
+	}
+	s.access.Lock()
+	if !s.started || s.suspended {
+		s.access.Unlock()
+		return
+	}
+	s.lastKickAt = time.Now()
+	s.access.Unlock()
+	select {
+	case s.kick <- struct{}{}:
+	default:
+	}
+}
+
 // watchLoop re-probes the selected member, and only that one, on its own short
 // interval. The tier interval is tuned for the cost of sweeping hundreds of
 // members, which makes it far too slow for the one member actually carrying
@@ -605,6 +626,8 @@ func (s *AutoSelector) requestRound() {
 func (s *AutoSelector) watchLoop() {
 	ticker := time.NewTicker(s.watchInterval)
 	defer ticker.Stop()
+	pauseCallback := pause.RegisterTicker(s.pause, ticker, s.watchInterval, nil)
+	defer s.pause.UnregisterCallback(pauseCallback)
 	for {
 		select {
 		case <-s.close:
@@ -736,6 +759,10 @@ func (s *AutoSelector) probeBatch(batch []string, urgent bool) []probeResult {
 				select {
 				case <-time.After(delay):
 				case <-s.close:
+					return
+				}
+				// The round began before the device or network paused; these members wait for the next one.
+				if s.pause.IsPaused() {
 					return
 				}
 			}
@@ -964,6 +991,8 @@ func (s *AutoSelector) enterSuspended(now time.Time, since time.Time) {
 func (s *AutoSelector) recoveryLoop() {
 	ticker := time.NewTicker(recoveryInterval)
 	defer ticker.Stop()
+	pauseCallback := pause.RegisterTicker(s.pause, ticker, recoveryInterval, nil)
+	defer s.pause.UnregisterCallback(pauseCallback)
 	backoff := recoveryInterval
 	var (
 		lastAttempt    time.Time
