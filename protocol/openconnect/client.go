@@ -65,6 +65,12 @@ type Endpoint struct {
 	statusUpdated      chan struct{}
 	terminalError      string
 	hotpCounter        atomic.Uint64
+	scope              *adapter.Scope
+	startOnce          sync.Once
+	startErr           error
+	clientStarted      bool
+	loopGroup          sync.WaitGroup
+	everReady          atomic.Bool
 }
 
 type clientState struct {
@@ -449,41 +455,63 @@ func (e *Endpoint) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		tunnelDevice.SetPacketWriter(e.writePacketBuffers)
 		e.device = tunnelDevice
 		e.deviceOptions = nil
+		e.scope = scope
+		// Registered here rather than by ensureStarted: a cleanup added by a start racing the scope close would never run.
+		scope.Add(e.closeClient)
 	case adapter.StartStatePostStart:
-		var loopGroup sync.WaitGroup
-		scope.Add(func() error {
-			loopGroup.Wait()
-			return nil
-		})
+		// Dials during preStart (rule-set downloads) come before PostStart, so the client also comes up on first use.
+		return e.ensureStarted()
+	}
+	return nil
+}
+
+// Never waits: the endpoint manager holds its lock while calling Start, and the client needs it to dial.
+func (e *Endpoint) ensureStarted() error {
+	e.startOnce.Do(func() {
+		if e.scope.Context().Err() != nil {
+			e.startErr = net.ErrClosed
+			return
+		}
 		err := e.client.Start()
 		if err != nil {
-			return err
+			e.startErr = err
+			return
 		}
-		scope.Add(e.client.Close)
+		e.clientStarted = true
 		e.stateAccess.Lock()
 		e.updateState(func(state *clientState) {
 			state.started = true
 		})
 		e.stateAccess.Unlock()
-		scope.Add(func() error {
-			e.stateAccess.Lock()
-			e.updateState(func(state *clientState) {
-				state.started = false
-			})
-			e.stateAccess.Unlock()
-			return nil
+		e.loopGroup.Go(func() {
+			e.readLoop(e.scope.Context())
 		})
-		loopGroup.Go(func() {
-			e.readLoop(scope.Context())
+		e.loopGroup.Go(func() {
+			e.watchAuthForms(e.scope.Context())
 		})
-		loopGroup.Go(func() {
-			e.watchAuthForms(scope.Context())
+		e.loopGroup.Go(func() {
+			e.watchActiveTransport(e.scope.Context())
 		})
-		loopGroup.Go(func() {
-			e.watchActiveTransport(scope.Context())
-		})
+	})
+	return e.startErr
+}
+
+func (e *Endpoint) closeClient() error {
+	// Waits out an in-flight ensureStarted and keeps any later one from starting the client.
+	e.startOnce.Do(func() {
+		e.startErr = net.ErrClosed
+	})
+	if !e.clientStarted {
+		return nil
 	}
-	return nil
+	e.stateAccess.Lock()
+	e.updateState(func(state *clientState) {
+		state.started = false
+	})
+	e.stateAccess.Unlock()
+	err := e.client.Close()
+	e.loopGroup.Wait()
+	return err
 }
 
 func (e *Endpoint) readLoop(ctx context.Context) {
@@ -526,10 +554,7 @@ func (e *Endpoint) SetKeepIdleConnections(keep bool) {
 
 func (e *Endpoint) waitReady(ctx context.Context) error {
 	if !e.onDemand {
-		if !e.ready() || !e.client.Ready() {
-			return E.New("endpoint is not ready yet")
-		}
-		return nil
+		return e.waitFirstReady(ctx)
 	}
 	e.client.Resume()
 	waitCtx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
@@ -557,7 +582,53 @@ func (e *Endpoint) waitReady(ctx context.Context) error {
 	}
 }
 
+// Until the tunnel has been up once, a dial waits for it instead of failing; after that it fails fast as before.
+func (e *Endpoint) waitFirstReady(ctx context.Context) error {
+	if e.ready() && e.client.Ready() {
+		e.everReady.Store(true)
+		return nil
+	}
+	if e.everReady.Load() {
+		return E.New("endpoint is not ready yet")
+	}
+	timer := time.NewTimer(C.TCPTimeout)
+	defer timer.Stop()
+	for {
+		// Taken before the check, so an update between the two cannot be missed.
+		updated := e.StatusUpdated()
+		if e.ready() && e.client.Ready() {
+			e.everReady.Store(true)
+			return nil
+		}
+		e.statusAccess.Lock()
+		terminalError := e.terminalError
+		e.statusAccess.Unlock()
+		if terminalError != "" {
+			return E.New("endpoint failed: ", terminalError)
+		}
+		if e.client.PendingAuthChallenge() != nil {
+			return E.New("endpoint is waiting for authentication")
+		}
+		select {
+		case <-updated:
+		case <-ctx.Done():
+			return E.Cause(ctx.Err(), "endpoint is not ready yet")
+		case <-e.scope.Context().Done():
+			return net.ErrClosed
+		case <-timer.C:
+			return E.New("endpoint is not ready yet")
+		}
+	}
+}
+
 func (e *Endpoint) PreMatchFlow(network string, destination netip.Addr) adapter.PreMatchAction {
+	// The tun inbound's GSO check probes without a destination; that is not a use.
+	if !destination.IsValid() {
+		return adapter.PreMatchFlow
+	}
+	if e.ensureStarted() != nil {
+		return adapter.PreMatchContinue
+	}
 	return adapter.PreMatchFlow
 }
 
@@ -591,6 +662,9 @@ func (e *Endpoint) ready() bool {
 }
 
 func (e *Endpoint) WritePackets(packets [][]byte) error {
+	if err := e.ensureStarted(); err != nil {
+		return err
+	}
 	if e.onDemand {
 		e.client.Resume()
 	}
@@ -634,6 +708,9 @@ func (e *Endpoint) DialContext(ctx context.Context, network string, destination 
 	case N.NetworkUDP:
 		e.logger.InfoContext(ctx, "outbound packet connection to ", destination)
 	}
+	if err := e.ensureStarted(); err != nil {
+		return nil, err
+	}
 	readyErr := e.waitReady(ctx)
 	if readyErr != nil {
 		return nil, readyErr
@@ -653,6 +730,9 @@ func (e *Endpoint) DialContext(ctx context.Context, network string, destination 
 
 func (e *Endpoint) ListenPacketWithDestination(ctx context.Context, destination M.Socksaddr) (net.PacketConn, netip.Addr, error) {
 	e.logger.InfoContext(ctx, "outbound packet connection to ", destination)
+	if err := e.ensureStarted(); err != nil {
+		return nil, netip.Addr{}, err
+	}
 	readyErr := e.waitReady(ctx)
 	if readyErr != nil {
 		return nil, netip.Addr{}, readyErr
