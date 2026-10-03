@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing/common"
@@ -29,6 +30,7 @@ type ClientBind struct {
 	dialer              N.Dialer
 	reservedAccess      sync.RWMutex
 	reservedForEndpoint map[netip.AddrPort][3]uint8
+	endpointReserved    atomic.Bool
 	connAccess          sync.Mutex
 	conn                *wireConn
 	done                chan struct{}
@@ -215,13 +217,14 @@ func (c *ClientBind) SetReservedForEndpoint(destination netip.AddrPort, reserved
 	c.reservedAccess.Lock()
 	c.reservedForEndpoint[destination] = reserved
 	c.reservedAccess.Unlock()
+	c.endpointReserved.Store(true)
 }
 
 // hasReserved reports whether the reserved-bytes feature is configured. When it
 // is not, the reserved field is left untouched so it can carry AmneziaWG magic
 // header bytes instead.
 func (c *ClientBind) hasReserved() bool {
-	return c.reserved != [3]uint8{} || len(c.reservedForEndpoint) > 0
+	return c.reserved != [3]uint8{} || c.endpointReserved.Load()
 }
 
 // canSetReserved reports whether b is an outgoing WireGuard message with the
