@@ -35,6 +35,7 @@ var (
 	_ adapter.URLTestGroup            = (*AutoSelector)(nil)
 	_ adapter.Referrer                = (*AutoSelector)(nil)
 	_ adapter.InterfaceUpdateListener = (*AutoSelector)(nil)
+	_ adapter.DialFailureListener     = (*AutoSelector)(nil)
 )
 
 const (
@@ -1483,6 +1484,10 @@ func (s *AutoSelector) noteDialResult(detour adapter.Outbound, network string, e
 		return
 	}
 
+	if E.IsMulti(err, context.Canceled, net.ErrClosed) {
+		// Abandoned rather than refused: the client went away, or a network reset closed the socket.
+		return
+	}
 	if isLocalNetworkError(err) {
 		// Nothing to learn about the member; go find out whether we still have
 		// a network at all.
@@ -1587,6 +1592,19 @@ func (s *AutoSelector) ListenPacket(ctx context.Context, destination M.Socksaddr
 		lastError = E.New("no usable outbound")
 	}
 	return nil, lastError
+}
+
+// DialFailed is the passive signal for members the router dials itself: Selected hands out flow outbounds and nested
+// groups unwrapped, so their failures never pass through DialContext. A memberHandle's dial already did.
+func (s *AutoSelector) DialFailed(detour adapter.Outbound, network string, err error) {
+	if _, isHandle := detour.(*memberHandle); isHandle {
+		return
+	}
+	member, loaded := s.outbounds[detour.Tag()]
+	if !loaded {
+		return
+	}
+	s.noteDialResult(member, network, err)
 }
 
 // memberHandle carries a member's identity, so routing, traffic accounting and the clash API see the member, while
