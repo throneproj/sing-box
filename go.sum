@@ -377,10 +377,10 @@ github.com/tailscale/web-client-prebuilt v0.0.0-20250124233751-d4cd19a26976 h1:U
 github.com/tailscale/web-client-prebuilt v0.0.0-20250124233751-d4cd19a26976/go.mod h1:agQPE6y6ldqCOui2gkIh7ZMztTkIQKH049tv8siLuNQ=
 github.com/tc-hib/winres v0.2.1 h1:YDE0FiP0VmtRaDn7+aaChp1KiF4owBiJa5l964l5ujA=
 github.com/tc-hib/winres v0.2.1/go.mod h1:C/JaNhH3KBvhNKVbvdlDWkbMDO9H4fKKDaN7/07SSuk=
-github.com/throneproj/sing v0.9.4-0.20261002235655-c4c9e6e3b2c1 h1:nwJcgK/lTOPhg7Awf4Vn23INzrtKWvu/5fM9vLjLSWY=
-github.com/throneproj/sing v0.9.4-0.20261002235655-c4c9e6e3b2c1/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
-github.com/throneproj/wireguard-go v0.0.0-20261019002100-de3e4a28dbfe h1:Rab9hs6bil0pF8Se/ZPIC2O5pBGy8HmZAFasrfy2PVI=
-github.com/throneproj/wireguard-go v0.0.0-20261019002100-de3e4a28dbfe/go.mod h1:er10sELpmzLXq7S7Pbc1Zsbyapcr+/gxNAHKTo6fzVA=
+github.com/throneproj/sing v0.9.4-0.20261024082846-e3e392877db8 h1:V3PK33YPQX6LACVpQ05UFTUKou6jm6bMUJ+sY/otZis=
+github.com/throneproj/sing v0.9.4-0.20261024082846-e3e392877db8/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
+github.com/throneproj/wireguard-go v0.0.0-20261024083039-e200848fa663 h1:xGWVa8IhL5cVPgxJyQrlHbtostxeTFP3f7f2VDQ7jZ0=
+github.com/throneproj/wireguard-go v0.0.0-20261024083039-e200848fa663/go.mod h1:er10sELpmzLXq7S7Pbc1Zsbyapcr+/gxNAHKTo6fzVA=
 github.com/tidwall/gjson v1.14.2/go.mod h1:/wbyibRr2FHMks5tjHJ5F8dMZh3AcwJEMf5vlfC0lxk=
 github.com/tidwall/gjson v1.18.0 h1:FIDeeyB800efLX89e5a8Y0BNH+LOngJyGrIWxG2FKQY=
 github.com/tidwall/gjson v1.18.0/go.mod h1:/wbyibRr2FHMks5tjHJ5F8dMZh3AcwJEMf5vlfC0lxk=

@@ -129,6 +129,7 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		}
 		err = E.Cause(err, "open connection to ", remoteString, dialerString)
 		m.deleteURLTestHistory(metadata.OutboundChain)
+		notifyDialFailure(metadata.OutboundChain, N.NetworkTCP, err)
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		m.logger.ErrorContext(ctx, err)
 		return
@@ -218,6 +219,7 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 			}
 			err = E.Cause(err, "open packet connection to ", remoteString, dialerString)
 			m.deleteURLTestHistory(metadata.OutboundChain)
+			notifyDialFailure(metadata.OutboundChain, N.NetworkUDP, err)
 			N.CloseOnHandshakeFailure(conn, onClose, err)
 			m.logger.ErrorContext(ctx, err)
 			return
@@ -242,6 +244,7 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 			}
 			err = E.Cause(err, "listen packet connection using ", dialerString)
 			m.deleteURLTestHistory(metadata.OutboundChain)
+			notifyDialFailure(metadata.OutboundChain, N.NetworkUDP, err)
 			N.CloseOnHandshakeFailure(conn, onClose, err)
 			m.logger.ErrorContext(ctx, err)
 			return
@@ -306,6 +309,14 @@ func (m *ConnectionManager) deleteURLTestHistory(chain []adapter.Outbound) {
 		return isURLTestGroup
 	}) {
 		m.urlTestHistory.DeleteURLTestHistory(chain[len(chain)-1].Tag())
+	}
+}
+
+func notifyDialFailure(chain []adapter.Outbound, network string, err error) {
+	for i := 1; i < len(chain); i++ {
+		if listener, isListener := chain[i-1].(adapter.DialFailureListener); isListener {
+			listener.DialFailed(chain[i], network, err)
+		}
 	}
 }
 
