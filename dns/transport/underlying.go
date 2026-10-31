@@ -3,8 +3,6 @@ package transport
 import (
 	"context"
 	"net"
-	"os/exec"
-	"strings"
 	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -27,9 +25,10 @@ func RegisterUnderlying(registry *dns.TransportRegistry) {
 	dns.RegisterTransport[option.RemoteDNSServerOptions](registry, C.DNSTypeUnderlying, NewUnderlying)
 }
 
-// Underlying is a UDP transport that follows the DNS server systemd-resolved
-// hands out for the current default interface, so queries can be sent to
-// whatever the underlying network would have used.
+// Underlying is a UDP transport that follows the DNS server the network of the
+// current default interface hands out (systemd-resolved's link on Linux, the
+// network service on macOS), so queries can be sent to whatever the underlying
+// network would have used.
 type Underlying struct {
 	*UDPTransport
 	logger     logger.ContextLogger
@@ -90,7 +89,7 @@ func (t *Underlying) updateServer(defaultInterface *control.Interface) {
 	if defaultInterface == nil {
 		err = E.New("no default interface")
 	} else {
-		server, err = resolvectlDNS(defaultInterface.Name)
+		server, err = detectUnderlyingServer(defaultInterface.Name)
 	}
 	t.access.Lock()
 	defer t.access.Unlock()
@@ -106,7 +105,7 @@ func (t *Underlying) updateServer(defaultInterface *control.Interface) {
 }
 
 // currentServer returns the detected server, retrying detection when the last
-// attempt failed so a transient resolvectl failure does not disable the
+// attempt failed so a transient detection failure does not disable the
 // transport until the next interface update.
 func (t *Underlying) currentServer() (M.Socksaddr, error) {
 	t.access.Lock()
@@ -121,23 +120,6 @@ func (t *Underlying) currentServer() (M.Socksaddr, error) {
 	t.access.Unlock()
 	if !server.IsValid() {
 		return M.Socksaddr{}, E.New("no underlying DNS server detected")
-	}
-	return server, nil
-}
-
-func resolvectlDNS(interfaceName string) (M.Socksaddr, error) {
-	output, err := exec.Command("resolvectl", "-i", interfaceName, "dns").Output()
-	if err != nil {
-		return M.Socksaddr{}, E.Cause(err, "execute resolvectl")
-	}
-	// Link 2 (eth0): 192.168.1.1
-	fields := strings.Fields(string(output))
-	if len(fields) < 4 {
-		return M.Socksaddr{}, E.New("unexpected resolvectl output: ", string(output))
-	}
-	server := M.ParseSocksaddrHostPortStr(fields[3], "53")
-	if !server.IsValid() {
-		return M.Socksaddr{}, E.New("unexpected resolvectl output: ", string(output))
 	}
 	return server, nil
 }
