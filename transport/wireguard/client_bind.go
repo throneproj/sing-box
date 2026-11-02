@@ -130,15 +130,19 @@ func (c *ClientBind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint)
 	}
 	n, addr, err := udpConn.ReadFrom(packets[0])
 	if err != nil {
-		udpConn.Close()
+		// Already closed means a send failed or the flow got no reply: not a read error.
+		closedHere := udpConn.Close() == nil
 		select {
 		case <-c.done:
 		default:
-			c.logger.Error(E.Cause(err, "read packet"))
+			if closedHere {
+				c.logger.Error(E.Cause(err, "read packet"))
+			}
 			err = nil
 		}
 		return
 	}
+	udpConn.unanswered.Store(false)
 	sizes[0] = n
 	// Only strip the reserved field when the reserved-bytes feature is in use.
 	// Leaving these bytes intact otherwise keeps AmneziaWG magic headers (which
@@ -146,7 +150,7 @@ func (c *ClientBind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint)
 	if c.hasReserved() && hasReservedField(packets[0][:n]) {
 		clear(packets[0][1:4])
 	}
-	eps[0] = remoteEndpoint(M.SocksaddrFromNet(addr).Unwrap().AddrPort())
+	eps[0] = remoteEndpoint{addr: M.SocksaddrFromNet(addr).Unwrap().AddrPort(), bind: c}
 	count = 1
 	return
 }
@@ -176,7 +180,7 @@ func (c *ClientBind) Send(bufs [][]byte, ep conn.Endpoint, offset int) error {
 		time.Sleep(time.Second)
 		return err
 	}
-	destination := netip.AddrPort(ep.(remoteEndpoint))
+	destination := ep.(remoteEndpoint).addr
 	for _, buf := range bufs {
 		if offset > 0 {
 			buf = buf[offset:]
@@ -200,7 +204,30 @@ func (c *ClientBind) Send(bufs [][]byte, ep conn.Endpoint, offset int) error {
 			return err
 		}
 	}
+	udpConn.unanswered.Store(true)
 	return nil
+}
+
+// closeUnanswered closes the connected flow when it carried a send that got no
+// reply, so that the next send or receive dials a new one. Behind a detour the
+// flow is a single long-lived connection (UDP over a TCP proxy stream, an
+// endpoint's stack) that can stop delivering without ever returning an error,
+// e.g. after the device slept and a NAT or the server dropped it silently. A
+// listening bind shares its flow between peers and is left alone.
+func (c *ClientBind) closeUnanswered() {
+	// Held while a new flow is dialed (or the bind closes): nothing to replace then,
+	// and waiting would hold up the peer behind the dial.
+	if !c.isConnect || !c.connAccess.TryLock() {
+		return
+	}
+	serverConn := c.conn
+	c.connAccess.Unlock()
+	if serverConn == nil || !serverConn.unanswered.Load() {
+		return
+	}
+	if serverConn.Close() == nil {
+		c.logger.Debug("no reply from server, reconnecting")
+	}
 }
 
 func (c *ClientBind) ParseEndpoint(s string) (conn.Endpoint, error) {
@@ -208,7 +235,7 @@ func (c *ClientBind) ParseEndpoint(s string) (conn.Endpoint, error) {
 	if err != nil {
 		return nil, err
 	}
-	return remoteEndpoint(ap), nil
+	return remoteEndpoint{addr: ap, bind: c}, nil
 }
 
 func (c *ClientBind) BatchSize() int {
@@ -244,9 +271,10 @@ func hasReservedField(b []byte) bool {
 
 type wireConn struct {
 	net.PacketConn
-	conn   net.Conn
-	access sync.Mutex
-	done   chan struct{}
+	conn       net.Conn
+	access     sync.Mutex
+	done       chan struct{}
+	unanswered atomic.Bool
 }
 
 func (w *wireConn) WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, error) {
@@ -271,9 +299,18 @@ func (w *wireConn) Close() error {
 
 var _ conn.Endpoint = (*remoteEndpoint)(nil)
 
-type remoteEndpoint netip.AddrPort
+type remoteEndpoint struct {
+	addr netip.AddrPort
+	bind *ClientBind
+}
 
+// ClearSrc is wireguard-go's hint that the path may be broken: a handshake went
+// unanswered or the peer stopped replying, and nothing arrived since. The flow
+// is this bind's path.
 func (e remoteEndpoint) ClearSrc() {
+	if e.bind != nil {
+		e.bind.closeUnanswered()
+	}
 }
 
 func (e remoteEndpoint) SrcToString() string {
@@ -281,16 +318,16 @@ func (e remoteEndpoint) SrcToString() string {
 }
 
 func (e remoteEndpoint) DstToString() string {
-	return netip.AddrPort(e).String()
+	return e.addr.String()
 }
 
 func (e remoteEndpoint) DstToBytes() []byte {
-	b, _ := netip.AddrPort(e).MarshalBinary()
+	b, _ := e.addr.MarshalBinary()
 	return b
 }
 
 func (e remoteEndpoint) DstIP() netip.Addr {
-	return netip.AddrPort(e).Addr()
+	return e.addr.Addr()
 }
 
 func (e remoteEndpoint) SrcIP() netip.Addr {
