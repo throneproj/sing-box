@@ -50,6 +50,8 @@ const (
 	TypeJuicity            = "juicity"
 	TypeTrustTunnel        = "trusttunnel"
 	TypeMASQUE             = "masque"
+	TypeDNSTT              = "dnstt"
+	TypeMasterDNS          = "masterdns"
 )
 
 const (
@@ -134,6 +136,10 @@ func ProxyDisplayName(proxyType string) string {
 		return "TrustTunnel"
 	case TypeMASQUE:
 		return "MASQUE"
+	case TypeDNSTT:
+		return "DNSTT"
+	case TypeMasterDNS:
+		return "MasterDNS"
 	case TypeSelector:
 		return "Selector"
 	case TypeURLTest:
