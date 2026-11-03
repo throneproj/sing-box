@@ -36,6 +36,8 @@
 | `tailcat`      | [Tailcat](./tailcat/)           |
 | `tor`          | [Tor](./tor/)                   |
 | `ssh`          | [SSH](./ssh/)                   |
+| `dnstt`        | [DNSTT](./dnstt/)               |
+| `masterdns`    | [MasterDNS](./masterdns/)       |
 | `dns`          | [DNS](./dns/)                   |
 | `selector`     | [Selector](./selector/)         |
 | `urltest`      | [URLTest](./urltest/)           |
