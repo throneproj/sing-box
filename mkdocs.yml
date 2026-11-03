@@ -204,6 +204,8 @@ nav:
           - Tailcat: configuration/outbound/tailcat.md
           - Tor: configuration/outbound/tor.md
           - SSH: configuration/outbound/ssh.md
+          - DNSTT: configuration/outbound/dnstt.md
+          - MasterDNS: configuration/outbound/masterdns.md
           - DNS: configuration/outbound/dns.md
           - Selector: configuration/outbound/selector.md
           - URLTest: configuration/outbound/urltest.md
