@@ -5,17 +5,24 @@ import (
 	"crypto/ecdsa"
 	"errors"
 	"net"
+	"net/netip"
 	"strings"
 	"time"
 
-	"github.com/sagernet/quic-go"
+	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/tls"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	masquetransport "github.com/sagernet/sing-box/transport/warpmasque"
+	"github.com/sagernet/sing-tun"
+	"github.com/sagernet/sing-tun/gtcpip/header"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json/badoption"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 )
 
 const (
@@ -141,7 +148,32 @@ func (e *Endpoint) dialCarrier(ctx context.Context, useHTTP2 bool) (masquetransp
 	if err != nil {
 		return nil, err
 	}
-	return masquetransport.DialHTTP3(ctx, e.outboundDialer, e.serverAddr, stdConfig, e.quicConfig)
+	packetConn, serverAddr, err := e.listenPacket(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return masquetransport.DialHTTP3(ctx, packetConn, serverAddr, stdConfig, e.quicConfig)
+}
+
+// listenPacket resolves the server itself: the resolve dialer would hide the socket behind a NAT wrapper.
+func (e *Endpoint) listenPacket(ctx context.Context) (net.PacketConn, M.Socksaddr, error) {
+	if !e.serverAddr.IsDomain() {
+		packetConn, err := e.outboundDialer.ListenPacket(ctx, e.serverAddr)
+		return packetConn, e.serverAddr, err
+	}
+	var queryOptions adapter.DNSQueryOptions
+	if resolveDialer, isResolveDialer := e.outboundDialer.(dialer.ResolveDialer); isResolveDialer {
+		queryOptions = resolveDialer.QueryOptions()
+	}
+	addresses, err := e.dnsRouter.Lookup(log.ContextWithOverrideLevel(ctx, log.LevelDebug), e.serverAddr.Fqdn, queryOptions)
+	if err != nil {
+		return nil, M.Socksaddr{}, err
+	}
+	packetConn, address, err := N.ListenSerial(ctx, e.outboundDialer, e.serverAddr, addresses)
+	if err != nil {
+		return nil, M.Socksaddr{}, err
+	}
+	return packetConn, M.SocksaddrFrom(address, e.serverAddr.Port), nil
 }
 
 func clientTLSOptions(tlsOptions option.OutboundTLSOptions, privateKey *ecdsa.PrivateKey, privateKeyPEM string, now time.Time) (option.OutboundTLSOptions, error) {
@@ -245,9 +277,9 @@ func (e *Endpoint) writePacket(conn masquetransport.Conn, packet []byte) error {
 	if err == nil {
 		return nil
 	}
-	var tooLargeErr *quic.DatagramTooLargeError
+	var tooLargeErr *masquetransport.PacketTooLargeError
 	if errors.As(err, &tooLargeErr) {
-		e.logger.Debug("drop packet: ", err)
+		e.replyPacketTooBig(packet, tooLargeErr.MTU)
 		return nil
 	}
 	e.access.Lock()
@@ -261,6 +293,31 @@ func (e *Endpoint) writePacket(conn masquetransport.Conn, packet []byte) error {
 		conn.Close()
 	}
 	return err
+}
+
+// replyPacketTooBig makes the sender shrink its packets, as a router would. Dropping the packet silently makes TCP
+// retransmit the same segment until the connection stalls.
+func (e *Endpoint) replyPacketTooBig(packet []byte, mtu int) {
+	minimumMTU := header.IPv4MinimumProcessableDatagramSize
+	if header.IPVersion(packet) == header.IPv6Version {
+		minimumMTU = header.IPv6MinimumMTU
+	}
+	if mtu < minimumMTU {
+		// The sender cannot go below the protocol minimum; path MTU discovery may still raise the limit.
+		e.logger.Debug("drop packet: carrier fits only ", mtu, " bytes")
+		return
+	}
+	headroom := e.device.FrontHeadroom()
+	reply, built := tun.BuildICMPError(packet, tun.ICMPErrorPacketTooBig, netip.Addr{}, uint32(mtu), headroom)
+	if !built {
+		return
+	}
+	replyBuffer := buf.As(reply)
+	replyBuffer.Advance(headroom)
+	err := e.device.WriteInboundBuffers([]*buf.Buffer{replyBuffer})
+	if err != nil {
+		e.logger.Debug(E.Cause(err, "write packet too big"))
+	}
 }
 
 func annotateError(err error) error {
