@@ -3,6 +3,7 @@ package warpmasque
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -13,11 +14,12 @@ import (
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/quic-go/quicvarint"
 	"github.com/sagernet/sing/common/buf"
-	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
-	N "github.com/sagernet/sing/common/network"
 )
+
+// The limit quic-go reports for a datagram leaves out the packet number, which takes up to 4 bytes.
+const packetNumberSlack = 4
 
 var _ Conn = (*http3Conn)(nil)
 
@@ -27,16 +29,18 @@ type http3Conn struct {
 	transport *quic.Transport
 	quicConn  *quic.Conn
 	stream    *http3.RequestStream
-	closeOnce sync.Once
+	// The quarter stream ID and context ID in front of every IP packet.
+	datagramPrefixLen int
+	closeOnce         sync.Once
 }
 
-func DialHTTP3(ctx context.Context, dialer N.Dialer, destination M.Socksaddr, tlsConfig *tls.Config, quicConfig *quic.Config) (Conn, error) {
-	udpConn, err := dialer.DialContext(ctx, N.NetworkUDP, destination)
-	if err != nil {
-		return nil, err
-	}
+// DialHTTP3 takes ownership of packetConn. It should be an unconnected socket: quic-go then drives the file
+// descriptor itself (GSO, ECN, batched reads, DF), which a connected one only allows through quic.DialConn,
+// and that cannot set the connection ID length.
+func DialHTTP3(ctx context.Context, packetConn net.PacketConn, destination M.Socksaddr, tlsConfig *tls.Config, quicConfig *quic.Config) (Conn, error) {
 	transport := &quic.Transport{
-		Conn:               bufio.NewUnbindPacketConn(udpConn),
+		Conn: packetConn,
+		// Cloudflare closes connections with PROTOCOL_VIOLATION now and then on the default length.
 		ConnectionIDLength: 20,
 	}
 	// The connection owns the transport and the UDP socket, so its death releases both.
@@ -44,7 +48,7 @@ func DialHTTP3(ctx context.Context, dialer N.Dialer, destination M.Socksaddr, tl
 	transport.SetCreatedConn(true)
 	tlsConfig = tlsConfig.Clone()
 	tlsConfig.NextProtos = []string{http3.NextProtoH3}
-	quicConn, err := transport.DialEarly(ctx, udpConn.RemoteAddr(), tlsConfig, quicConfig)
+	quicConn, err := transport.DialEarly(ctx, destination.UDPAddr(), tlsConfig, quicConfig)
 	if err != nil {
 		transport.Close()
 		return nil, err
@@ -57,11 +61,12 @@ func DialHTTP3(ctx context.Context, dialer N.Dialer, destination M.Socksaddr, tl
 	}
 	connCtx, cancel := context.WithCancelCause(quicConn.Context())
 	conn := &http3Conn{
-		ctx:       connCtx,
-		cancel:    cancel,
-		transport: transport,
-		quicConn:  quicConn,
-		stream:    stream,
+		ctx:               connCtx,
+		cancel:            cancel,
+		transport:         transport,
+		quicConn:          quicConn,
+		stream:            stream,
+		datagramPrefixLen: quicvarint.Len(uint64(stream.StreamID()/4)) + quicvarint.Len(contextIDIP),
 	}
 	go conn.drainCapsules()
 	return conn, nil
@@ -171,7 +176,12 @@ func (c *http3Conn) WritePacket(packet []byte) error {
 	if err != nil {
 		return err
 	}
-	return c.stream.SendDatagram(buffer.Bytes())
+	err = c.stream.SendDatagram(buffer.Bytes())
+	var tooLargeErr *quic.DatagramTooLargeError
+	if errors.As(err, &tooLargeErr) {
+		return &PacketTooLargeError{MTU: int(tooLargeErr.MaxDatagramPayloadSize) - c.datagramPrefixLen - packetNumberSlack}
+	}
+	return err
 }
 
 func (c *http3Conn) Close() error {

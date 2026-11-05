@@ -39,8 +39,9 @@ const (
 	defaultServerPort        = 443
 	defaultKeepAlivePeriod   = 30 * time.Second
 	defaultInitialPacketSize = 1242
-	// quic-go's worst-case packet overhead (37) plus the quarter stream ID and context ID.
-	datagramOverhead = 39
+	// Worst case per IP packet: short header with a 20-byte connection ID and a 4-byte packet number (25), AEAD tag
+	// (16), DATAGRAM frame header (3), quarter stream ID and context ID (2).
+	datagramOverhead = 46
 )
 
 var (
