@@ -171,9 +171,11 @@ type AutoSelector struct {
 	history  *urltest.HistoryStorage
 	logger   logger.ContextLogger
 
-	tags       []string
-	link       string
-	connectURL string
+	tags        []string
+	upstreamTag string
+	upstream    adapter.Outbound
+	link        string
+	connectURL  string
 
 	interval        time.Duration
 	benchInterval   time.Duration
@@ -228,6 +230,10 @@ type AutoSelector struct {
 	connOK        bool
 	connCheckedAt time.Time
 
+	upstreamAccess    sync.Mutex
+	upstreamAlive     bool
+	upstreamCheckedAt time.Time
+
 	pauseCallback *list.Element[pause.Callback]
 	kick          chan struct{}
 	close         chan struct{}
@@ -238,9 +244,13 @@ func NewAutoSelector(ctx context.Context, router adapter.Router, logger log.Cont
 	if len(options.Outbounds) == 0 {
 		return nil, E.New("missing tags")
 	}
+	dependencies := options.Outbounds
+	if options.Upstream != "" {
+		dependencies = append(slices.Clone(options.Outbounds), options.Upstream)
+	}
 	groupCtx, cancel := context.WithCancel(ctx)
 	s := &AutoSelector{
-		Adapter:                      outbound.NewAdapter(C.TypeAutoSelector, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.Outbounds),
+		Adapter:                      outbound.NewAdapter(C.TypeAutoSelector, tag, []string{N.NetworkTCP, N.NetworkUDP}, dependencies),
 		ctx:                          groupCtx,
 		cancel:                       cancel,
 		outbound:                     service.FromContext[adapter.OutboundManager](ctx),
@@ -249,6 +259,7 @@ func NewAutoSelector(ctx context.Context, router adapter.Router, logger log.Cont
 		history:                      service.PtrFromContext[urltest.HistoryStorage](ctx),
 		logger:                       logger,
 		tags:                         options.Outbounds,
+		upstreamTag:                  options.Upstream,
 		link:                         options.URL,
 		connectURL:                   options.ConnectivityURL,
 		interval:                     time.Duration(options.Interval),
@@ -423,6 +434,13 @@ func (s *AutoSelector) start() error {
 		if !isGroup && !isFlow {
 			s.handles[tag] = &memberHandle{Outbound: detour, selector: s}
 		}
+	}
+	if s.upstreamTag != "" {
+		upstream, loaded := s.outbound.Outbound(s.upstreamTag)
+		if !loaded {
+			return E.New("upstream not found: ", s.upstreamTag)
+		}
+		s.upstream = upstream
 	}
 
 	s.access.Lock()
@@ -906,9 +924,9 @@ func (s *AutoSelector) commitRound(results []probeResult, startedAt time.Time) {
 		case succeeded == 0 && failed >= outageProbeQuorum:
 			// A whole round failing is suspicious but not proof — a subscription
 			// can genuinely expire. Only an independent check may conclude.
-			outage = !s.connectivityOK(true)
+			outage = !s.connectivityOK(true) || !s.upstreamOK(true)
 		case brokeTogether >= outageProbeQuorum:
-			outage = !s.connectivityOK(true)
+			outage = !s.connectivityOK(true) || !s.upstreamOK(true)
 		}
 	}
 
@@ -1002,6 +1020,28 @@ func (s *AutoSelector) connectivityOK(force bool) bool {
 	return s.connOK
 }
 
+// upstreamOK probes the test URL through the upstream alone, cached like connectivityOK.
+func (s *AutoSelector) upstreamOK(force bool) bool {
+	if s.upstream == nil {
+		return true
+	}
+	s.upstreamAccess.Lock()
+	defer s.upstreamAccess.Unlock()
+	age := time.Since(s.upstreamCheckedAt)
+	if age < connectivityTTL && !force {
+		return s.upstreamAlive
+	}
+	if age < time.Second {
+		return s.upstreamAlive
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, s.probeTimeout)
+	defer cancel()
+	_, err := urltest.URLTest(ctx, s.link, s.upstream)
+	s.upstreamAlive = err == nil
+	s.upstreamCheckedAt = time.Now()
+	return s.upstreamAlive
+}
+
 func (s *AutoSelector) isSuspended() bool {
 	s.access.Lock()
 	defer s.access.Unlock()
@@ -1045,8 +1085,8 @@ func (s *AutoSelector) enterSuspended(now time.Time, since time.Time) {
 // recoveryLoop runs only while suspended, polling the local network far more
 // often than the normal probe interval so recovery is not delayed by a minute.
 //
-// The connectivity URL leads until osResumeGrace, then the OS route alone; an
-// optimistic probe answering overrules both.
+// The connectivity URL and the upstream lead until osResumeGrace, then the OS
+// route alone; an optimistic probe answering overrules all of them.
 func (s *AutoSelector) recoveryLoop() {
 	ticker := time.NewTicker(recoveryInterval)
 	defer ticker.Stop()
@@ -1081,8 +1121,8 @@ func (s *AutoSelector) recoveryLoop() {
 
 		now := time.Now()
 		ready := index >= 0
-		if ready && s.connectURL != "" && s.suspendedFor(now) < osResumeGrace {
-			ready = s.connectivityOK(true)
+		if ready && s.suspendedFor(now) < osResumeGrace {
+			ready = (s.connectURL == "" || s.connectivityOK(true)) && s.upstreamOK(true)
 		}
 		if !ready {
 			// Both signals can be wrong while a member still works, so keep asking a few.
@@ -1529,7 +1569,7 @@ func (s *AutoSelector) assessOutage() {
 	if s.isSuspended() {
 		return
 	}
-	if s.networkInterfaceDown() || (s.connectURL != "" && !s.connectivityOK(false)) {
+	if s.networkInterfaceDown() || (s.connectURL != "" && !s.connectivityOK(false)) || !s.upstreamOK(false) {
 		// No round to scope the rollback to; the fixed window covers the dials
 		// that raised the alarm.
 		s.enterSuspended(time.Now(), time.Time{})

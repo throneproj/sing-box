@@ -33,6 +33,10 @@ type AutoSelectorOutboundOptions struct {
 	// back to error classification plus the round-quorum heuristic, which is
 	// what censored networks need since any fixed endpoint may be blocked.
 	ConnectivityURL string `json:"connectivity_url,omitempty"`
+	// Upstream is the outbound every member dials through when the group sits
+	// behind a fixed hop in a chain. It is checked before a correlated failure is
+	// blamed on the members: if it is down, the members were never reached.
+	Upstream string `json:"upstream,omitempty"`
 
 	// Interval is the probe period of the active tier (the top-ranked members
 	// that could actually be selected next). BenchInterval is the much slower
