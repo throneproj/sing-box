@@ -2,6 +2,10 @@
 icon: material/new-box
 ---
 
+!!! quote "sing-box 1.15.0 中的更改"
+
+    :material-plus: [quic_opener](#quic_opener)
+
 !!! quote "sing-box 1.14.0 中的更改"
 
     :material-alert: [domain_resolver](#domain_resolver)  
@@ -46,6 +50,7 @@ icon: material/new-box
   "tcp_keep_alive": "",
   "tcp_keep_alive_interval": "",
   "udp_fragment": false,
+  "quic_opener": false,
 
   "domain_resolver": "", // 或 {}
   "network_strategy": "",
@@ -168,6 +173,16 @@ TCP keep alive 间隔。
 #### udp_fragment
 
 启用 UDP 分段。
+
+#### quic_opener
+
+!!! question "自 sing-box 1.15.0 起"
+
+在每个新的 UDP 套接字上，向目标发送一个 1200 字节、负载随机、形似 QUIC v2 Initial 的诱饵数据包作为第一个数据包。
+
+部分 DPI 按第一个数据包的 QUIC 版本对 UDP 流进行分类，且仅阻断 QUIC v1 流，因此先发送诱饵后，随后的 QUIC v1 握手可以通过。QUIC v1 服务器会静默丢弃该诱饵。
+
+适用于出站的所有 UDP 套接字，而不仅是 QUIC。
 
 #### domain_resolver
 
