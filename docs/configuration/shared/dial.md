@@ -2,6 +2,10 @@
 icon: material/new-box
 ---
 
+!!! quote "Changes in sing-box 1.15.0"
+
+    :material-plus: [quic_opener](#quic_opener)
+
 !!! quote "Changes in sing-box 1.14.0"
 
     :material-alert: [domain_resolver](#domain_resolver)  
@@ -46,6 +50,7 @@ icon: material/new-box
   "tcp_keep_alive": "",
   "tcp_keep_alive_interval": "",
   "udp_fragment": false,
+  "quic_opener": false,
 
   "domain_resolver": "", // or {}
   "network_strategy": "",
@@ -170,6 +175,16 @@ TCP keep alive interval.
 #### udp_fragment
 
 Enable UDP fragmentation.
+
+#### quic_opener
+
+!!! question "Since sing-box 1.15.0"
+
+Send a 1200-byte decoy packet shaped like a QUIC v2 Initial, with a random payload, to the destination as the first packet of every new UDP socket.
+
+Some DPI classifies a UDP flow by the QUIC version of its first packet and blocks only QUIC v1 flows, so with the decoy sent first, the QUIC v1 handshake that follows passes. QUIC v1 servers drop the decoy silently.
+
+Applies to all UDP sockets of the outbound, not only QUIC ones.
 
 #### domain_resolver
 
