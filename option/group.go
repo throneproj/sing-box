@@ -75,6 +75,20 @@ type AutoSelectorOutboundOptions struct {
 	Baselines     []badoption.Duration `json:"baselines,omitempty"`
 	Expected      int                  `json:"expected,omitempty"`
 
+	// Strategy "priority" uses the highest-priority healthy member instead of the
+	// best measured one, and moves back up to a recovered member only after it has
+	// passed FailbackChecks checks in a row and FailbackDelay since its last failure.
+	// Moving back up leaves live connections alone unless FailbackInterrupt is set.
+	Strategy string `json:"strategy,omitempty"`
+	// Tiers orders members for the priority strategy, most preferred first: a
+	// member's priority is the first tier listing it, members in no tier share one
+	// more tier after the last, and within a tier the health ranking applies.
+	// Without tiers, the order of Outbounds is the priority order.
+	Tiers             [][]string         `json:"tiers,omitempty"`
+	FailbackChecks    int                `json:"failback_checks,omitempty"`
+	FailbackDelay     badoption.Duration `json:"failback_delay,omitempty"`
+	FailbackInterrupt bool               `json:"failback_interrupt,omitempty"`
+
 	// Balance spreads traffic over the qualified set instead of pinning the
 	// single best member. Disabled by default.
 	//
@@ -90,6 +104,21 @@ type AutoSelectorOutboundOptions struct {
 	// selected one fails, before the error is handed back to the client.
 	DialRetries               int  `json:"dial_retries,omitempty"`
 	InterruptExistConnections bool `json:"interrupt_exist_connections,omitempty"`
+
+	Passive *AutoSelectorPassiveOptions `json:"passive,omitempty"`
+}
+
+// AutoSelectorPassiveOptions scores members on the connections they carry, not
+// only on probes. A connection is answered at its first byte back, or failed: a
+// TCP connection that sent and closed with nothing back, a UDP flow left
+// unanswered, a failed dial. A member whose recent outcomes are mostly failures
+// is held out of the selection, for longer each time it repeats, and a site that
+// failed on a member goes to the one that last answered it instead.
+type AutoSelectorPassiveOptions struct {
+	Enabled bool `json:"enabled,omitempty"`
+	// SiteMemory is how long a site keeps the member that last answered it, and
+	// avoids one that failed it. Zero means one hour.
+	SiteMemory badoption.Duration `json:"site_memory,omitempty"`
 }
 
 // AutoSelectorWarmEntry is one member's health carried over from a previous run.

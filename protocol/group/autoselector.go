@@ -7,6 +7,7 @@ import (
 	"net"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -44,6 +45,11 @@ const (
 )
 
 const (
+	StrategyLatency  = "latency"
+	StrategyPriority = "priority"
+)
+
+const (
 	defaultAutoInterval      = 1 * time.Minute
 	defaultAutoBenchInterval = 10 * time.Minute
 	defaultAutoSampling      = 10
@@ -58,6 +64,8 @@ const (
 	defaultAutoExpected        = 5
 	defaultAutoBalanceInterval = 30 * time.Second
 	defaultAutoDialRetries     = 2
+	defaultAutoFailbackChecks  = 3
+	defaultAutoFailbackDelay   = 1 * time.Minute
 
 	// How often the selected member alone is re-probed. Independent of the tier
 	// interval on purpose: a broken exit that still accepts TCP produces no dial
@@ -122,6 +130,16 @@ type AutoSelectorMemberStatus struct {
 	LastProbe     time.Time `json:"last_probe"`
 	CooldownUntil time.Time `json:"cooldown_until"`
 	LastError     string    `json:"last_error"`
+	Priority      int       `json:"priority"`
+	Streak        int       `json:"streak"`
+	LastFailure   time.Time `json:"last_failure"`
+	// Passive scoring. Recent* are the decaying counts the suspect rule reads.
+	FirstByteMs     int       `json:"first_byte_ms"`
+	PassiveAnswered int       `json:"passive_answered"`
+	PassiveFailed   int       `json:"passive_failed"`
+	RecentAnswered  int       `json:"recent_answered"`
+	RecentFailed    int       `json:"recent_failed"`
+	SuspectUntil    time.Time `json:"suspect_until"`
 }
 
 // AutoSelectorStatus is a point-in-time snapshot of a whole group.
@@ -134,6 +152,11 @@ type AutoSelectorStatus struct {
 	// is reported separately from Selected because the two differ whenever the
 	// pinned member is not currently healthy.
 	Pinned           string                     `json:"pinned"`
+	Strategy         string                     `json:"strategy"`
+	FailbackChecks   int                        `json:"failback_checks"`
+	FailbackDelay    time.Duration              `json:"failback_delay"`
+	Passive          bool                       `json:"passive"`
+	SitesRemembered  int                        `json:"sites_remembered"`
 	Balance          bool                       `json:"balance"`
 	BalanceMode      string                     `json:"balance_mode"`
 	Suspended        bool                       `json:"suspended"`
@@ -194,9 +217,23 @@ type AutoSelector struct {
 	balanceInterval time.Duration
 	dialRetries     int
 
+	strategy          string
+	priority          map[string]int
+	failbackChecks    int
+	failbackDelay     time.Duration
+	failbackInterrupt bool
+
+	passive       bool
+	siteMemory    time.Duration
+	replyTimeout  time.Duration
+	sites         map[string]*siteRecord
+	sitesPrunedAt time.Time
+
 	interruptGroup               *interrupt.Group
 	attachedGroup                *interrupt.Group
 	interruptExternalConnections bool
+	// Set while the selector tears down its own connections, which say nothing about their members.
+	interrupting atomic.Bool
 
 	access     sync.Mutex
 	members    map[string]*memberHealth
@@ -244,6 +281,18 @@ func NewAutoSelector(ctx context.Context, router adapter.Router, logger log.Cont
 	if len(options.Outbounds) == 0 {
 		return nil, E.New("missing tags")
 	}
+	var priority map[string]int
+	switch options.Strategy {
+	case "", StrategyLatency:
+	case StrategyPriority:
+		var err error
+		priority, err = memberPriority(options.Outbounds, options.Tiers)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, E.New("unknown strategy: ", options.Strategy)
+	}
 	dependencies := options.Outbounds
 	if options.Upstream != "" {
 		dependencies = append(slices.Clone(options.Outbounds), options.Upstream)
@@ -276,6 +325,11 @@ func NewAutoSelector(ctx context.Context, router adapter.Router, logger log.Cont
 		balanceMode:                  options.BalanceMode,
 		balanceInterval:              time.Duration(options.BalanceInterval),
 		dialRetries:                  options.DialRetries,
+		strategy:                     options.Strategy,
+		priority:                     priority,
+		failbackChecks:               options.FailbackChecks,
+		failbackDelay:                time.Duration(options.FailbackDelay),
+		failbackInterrupt:            options.FailbackInterrupt,
 		interruptGroup:               interrupt.NewGroup(),
 		attachedGroup:                interrupt.NewGroup(),
 		interruptExternalConnections: options.InterruptExistConnections,
@@ -286,6 +340,11 @@ func NewAutoSelector(ctx context.Context, router adapter.Router, logger log.Cont
 		recentDialFails:              make(map[string]time.Time),
 		kick:                         make(chan struct{}, 1),
 		close:                        make(chan struct{}),
+	}
+	if options.Passive != nil && options.Passive.Enabled {
+		s.passive = true
+		s.siteMemory = time.Duration(options.Passive.SiteMemory)
+		s.sites = make(map[string]*siteRecord)
 	}
 	if options.Tolerance > 0 {
 		s.tolerance = time.Duration(options.Tolerance) * time.Millisecond
@@ -405,6 +464,58 @@ func (s *AutoSelector) applyDefaults() {
 	} else if s.dialRetries == 0 {
 		s.dialRetries = defaultAutoDialRetries
 	}
+	if s.strategy == "" {
+		s.strategy = StrategyLatency
+	}
+	if s.failbackChecks <= 0 {
+		s.failbackChecks = defaultAutoFailbackChecks
+	}
+	// The ring cannot show more checks in a row than it holds.
+	if s.failbackChecks > s.sampling {
+		s.failbackChecks = s.sampling
+	}
+	if s.failbackDelay <= 0 {
+		s.failbackDelay = defaultAutoFailbackDelay
+	}
+	if s.siteMemory <= 0 {
+		s.siteMemory = defaultAutoSiteMemory
+	}
+	if s.replyTimeout <= 0 {
+		s.replyTimeout = passiveReplyTimeout
+	}
+}
+
+// memberPriority maps each member to the index of the first tier listing it.
+func memberPriority(tags []string, tiers [][]string) (map[string]int, error) {
+	priority := make(map[string]int, len(tags))
+	if len(tiers) == 0 {
+		for i, tag := range tags {
+			if _, loaded := priority[tag]; !loaded {
+				priority[tag] = i
+			}
+		}
+		return priority, nil
+	}
+	members := make(map[string]bool, len(tags))
+	for _, tag := range tags {
+		members[tag] = true
+	}
+	for i, tier := range tiers {
+		for _, tag := range tier {
+			if !members[tag] {
+				return nil, E.New("tier ", i, ": unknown member ", tag)
+			}
+			if _, loaded := priority[tag]; !loaded {
+				priority[tag] = i
+			}
+		}
+	}
+	for _, tag := range tags {
+		if _, loaded := priority[tag]; !loaded {
+			priority[tag] = len(tiers)
+		}
+	}
+	return priority, nil
 }
 
 func (s *AutoSelector) Start(stage adapter.StartStage, scope *adapter.Scope) error {
@@ -551,9 +662,9 @@ func (s *AutoSelector) References() []string {
 	if selectedUDP := s.selectedUDP.Load(); selectedUDP != nil && selectedUDP != selectedTCP {
 		references = append(references, selectedUDP.Tag())
 	}
-	// While balancing, every qualified member carries traffic, not only the current pick.
+	// While balancing, the whole balance set carries traffic, not only the current pick.
 	if s.balance && s.pinnedTag == "" {
-		references = append(references, s.qualified...)
+		references = append(references, s.balanceSetLocked(N.NetworkTCP)...)
 	}
 	return references
 }
@@ -612,7 +723,7 @@ func (s *AutoSelector) pinnedFor(network string, byTag map[string]*rankedNode) a
 		return nil
 	}
 	node, loaded := byTag[s.pinnedTag]
-	if !loaded || node.tier != tierHealthy {
+	if !loaded || node.tier != tierHealthy || node.suspect {
 		return nil
 	}
 	detour, loaded := s.outbounds[s.pinnedTag]
@@ -714,42 +825,95 @@ func (s *AutoSelector) watchLoop() {
 		if s.isSuspended() {
 			continue
 		}
-		detour := s.selectedFor(N.NetworkTCP)
-		if detour == nil {
-			continue
+		// Real traffic answering since the last tick already says what the probe would.
+		if detour := s.selectedFor(N.NetworkTCP); detour != nil && !s.serving(detour.Tag()) {
+			s.watchSelected(detour)
 		}
-		value, err := s.probe(detour)
-		now := time.Now()
-		if value != rttFailed {
-			s.access.Lock()
-			if health, loaded := s.members[detour.Tag()]; loaded {
-				health.put(value, now)
-				health.lastDialErr = ""
-				health.clearCooldown()
-			}
-			s.access.Unlock()
-			continue
+		s.access.Lock()
+		recovering := s.recoveringLocked()
+		s.access.Unlock()
+		if recovering != nil {
+			s.confirmRecovery(recovering)
 		}
-		if isLocalNetworkError(err) {
-			go s.assessOutage()
-			continue
-		}
-		// One failed probe is a signal, not a verdict — it goes into the ring
-		// like any other and the ranking decides what it is worth. What it does
-		// buy is an immediate round over the active tier, so the answer comes in
-		// seconds rather than at the next tick.
+	}
+}
+
+func (s *AutoSelector) watchSelected(detour adapter.Outbound) {
+	value, err := s.probe(detour)
+	now := time.Now()
+	if value != rttFailed {
 		s.access.Lock()
 		if health, loaded := s.members[detour.Tag()]; loaded {
-			health.put(rttFailed, now)
-			if err != nil {
-				health.lastDialErr = err.Error()
-			}
+			health.put(value, now)
+			health.lastDialErr = ""
+			health.clearCooldown()
 		}
-		s.evaluateLocked(now)
 		s.access.Unlock()
-		s.logger.Debug("auto-selector: selected member ", detour.Tag(), " failed its watch probe, checking the active tier")
-		s.requestRound()
+		return
 	}
+	if isLocalNetworkError(err) {
+		go s.assessOutage()
+		return
+	}
+	// One failed probe is a signal, not a verdict — it goes into the ring
+	// like any other and the ranking decides what it is worth. What it does
+	// buy is an immediate round over the active tier, so the answer comes in
+	// seconds rather than at the next tick.
+	s.access.Lock()
+	if health, loaded := s.members[detour.Tag()]; loaded {
+		health.put(rttFailed, now)
+		if err != nil {
+			health.lastDialErr = err.Error()
+		}
+	}
+	s.evaluateLocked(now)
+	s.access.Unlock()
+	s.logger.Debug("auto-selector: selected member ", detour.Tag(), " failed its watch probe, checking the active tier")
+	s.requestRound()
+}
+
+// recoveringLocked returns the higher-priority member the group would move back up to once it settles, while its
+// latest check passed: one that keeps failing is left to the tier interval.
+func (s *AutoSelector) recoveringLocked() adapter.Outbound {
+	current := s.selectedTCP.Load()
+	if s.strategy != StrategyPriority || s.pinnedTag != "" || current == nil {
+		return nil
+	}
+	top := s.priority[current.Tag()]
+	for _, node := range s.ranked {
+		if node.tier != tierHealthy || node.priority >= top {
+			continue
+		}
+		if health, loaded := s.members[node.tag]; loaded && health.streak() > 0 {
+			return s.outbounds[node.tag]
+		}
+	}
+	return nil
+}
+
+// confirmRecovery checks a recovering member at the watch rate, so moving back up takes failback_checks watch
+// intervals rather than as many rounds.
+func (s *AutoSelector) confirmRecovery(detour adapter.Outbound) {
+	value, err := s.probe(detour)
+	if value == rttFailed && isLocalNetworkError(err) {
+		go s.assessOutage()
+		return
+	}
+	now := time.Now()
+	s.access.Lock()
+	defer s.access.Unlock()
+	health, loaded := s.members[detour.Tag()]
+	if !loaded {
+		return
+	}
+	health.put(value, now)
+	if err != nil {
+		health.lastDialErr = err.Error()
+	} else {
+		health.lastDialErr = ""
+		health.clearCooldown()
+	}
+	s.evaluateLocked(now)
 }
 
 // roundBatch picks the members to probe this round: the whole active tier, plus
@@ -761,15 +925,18 @@ func (s *AutoSelector) roundBatch(urgent bool) []string {
 	s.access.Lock()
 	defer s.access.Unlock()
 
-	batch := make([]string, 0, s.activeSize+8)
-	seen := make(map[string]bool, s.activeSize+8)
-	for i := 0; i < len(s.ranked) && len(batch) < s.activeSize; i++ {
-		tag := s.ranked[i].tag
-		if seen[tag] {
+	now := time.Now()
+	batch := make([]string, 0, len(s.activeSet)+8)
+	seen := make(map[string]bool, len(s.activeSet)+8)
+	for _, node := range s.ranked {
+		if !s.activeSet[node.tag] || seen[node.tag] {
 			continue
 		}
-		seen[tag] = true
-		batch = append(batch, tag)
+		seen[node.tag] = true
+		if !urgent && s.passiveCoveredLocked(node.tag, now) {
+			continue
+		}
+		batch = append(batch, node.tag)
 	}
 	if urgent || len(s.benchOrder) == 0 {
 		return batch
@@ -1075,6 +1242,7 @@ func (s *AutoSelector) enterSuspended(now time.Time, since time.Time) {
 			rolledCooldowns++
 		}
 	}
+	s.rollbackPassiveLocked(since)
 	s.access.Unlock()
 
 	s.logger.Warn("auto-selector: local network is down, suspending health checks (rolled back ",
@@ -1204,6 +1372,13 @@ func (s *AutoSelector) optimisticBatch() []string {
 // evaluateLocked re-ranks every member and updates the selection. Caller holds
 // s.access.
 func (s *AutoSelector) evaluateLocked(now time.Time) {
+	byPriority := s.strategy == StrategyPriority
+	var carrying []string
+	for _, detour := range []adapter.Outbound{s.selectedTCP.Load(), s.selectedUDP.Load()} {
+		if detour != nil {
+			carrying = append(carrying, detour.Tag())
+		}
+	}
 	nodes := make([]*rankedNode, 0, len(s.tags))
 	byTag := make(map[string]*rankedNode, len(s.tags))
 	for _, tag := range s.tags {
@@ -1223,6 +1398,14 @@ func (s *AutoSelector) evaluateLocked(now time.Time) {
 		default:
 			node.tier = tierHealthy
 		}
+		if s.passive {
+			node.suspect = health.passive.suspect(now)
+		}
+		if byPriority {
+			node.priority = s.priority[tag]
+			// The fail-back gate is for moving to a member; one already carrying traffic keeps its place.
+			node.settled = common.Contains(carrying, tag) || health.settled(now, s.failbackChecks, s.failbackDelay)
+		}
 		nodes = append(nodes, node)
 		byTag[tag] = node
 	}
@@ -1235,21 +1418,14 @@ func (s *AutoSelector) evaluateLocked(now time.Time) {
 	ordered := make([]*rankedNode, len(nodes))
 	copy(ordered, nodes)
 	stableByPrior(ordered, prior)
-	sortNodes(ordered)
+	sortNodes(ordered, byPriority)
 	s.ranked = ordered
 
 	eligible := make([]*rankedNode, 0, len(ordered))
 	for _, node := range ordered {
-		if node.tier != tierHealthy {
-			continue
+		if s.qualifies(node) {
+			eligible = append(eligible, node)
 		}
-		if s.maxRTT > 0 && node.stats.Average >= s.maxRTT {
-			continue
-		}
-		if node.stats.FailRatio() > s.failTolerance {
-			continue
-		}
-		eligible = append(eligible, node)
 	}
 	qualified := applyBaselines(eligible, s.baselines, s.expected)
 	qualifiedTags := make([]string, 0, len(qualified))
@@ -1261,14 +1437,36 @@ func (s *AutoSelector) evaluateLocked(now time.Time) {
 	if balancedSetChanged {
 		s.notifyReferences()
 	}
-	s.refreshActiveSetLocked()
 	s.updateSelectionLocked(qualified, byTag, now)
+	s.refreshActiveSetLocked()
 }
 
+func (s *AutoSelector) qualifies(node *rankedNode) bool {
+	if node.tier != tierHealthy || node.suspect {
+		return false
+	}
+	if s.maxRTT > 0 && node.stats.Average >= s.maxRTT {
+		return false
+	}
+	return node.stats.FailRatio() <= s.failTolerance
+}
+
+// refreshActiveSetLocked runs after the selection is settled: under the priority strategy every member above the
+// tier in use is probed at the tier interval, since those are what the group moves back up to.
 func (s *AutoSelector) refreshActiveSetLocked() {
 	s.activeSet = make(map[string]bool, s.activeSize)
 	for i := 0; i < len(s.ranked) && i < s.activeSize; i++ {
 		s.activeSet[s.ranked[i].tag] = true
+	}
+	current := s.selectedTCP.Load()
+	if s.strategy != StrategyPriority || current == nil {
+		return
+	}
+	top := s.priority[current.Tag()]
+	for _, node := range s.ranked {
+		if s.priority[node.tag] < top {
+			s.activeSet[node.tag] = true
+		}
 	}
 }
 
@@ -1324,6 +1522,10 @@ func (s *AutoSelector) updateNetworkSelectionLocked(network string, qualified []
 		}
 		return
 	}
+	if s.strategy == StrategyPriority {
+		s.updatePrioritySelectionLocked(network, candidates, byTag, current, now)
+		return
+	}
 
 	// Incumbent stays unless a challenger beats it by more than the tolerance.
 	if current != nil {
@@ -1337,6 +1539,36 @@ func (s *AutoSelector) updateNetworkSelectionLocked(network string, qualified []
 		}
 	}
 	s.setSelectedLocked(s.outbounds[candidates[0].tag], network, "best available", now, true)
+}
+
+// updatePrioritySelectionLocked keeps a qualifying incumbent until a settled member of a higher tier exists, or
+// within its own tier until a challenger beats it by the tolerance. Losing it takes the first candidate: candidates
+// rank settled members first, so a member still proving its recovery is a last resort.
+func (s *AutoSelector) updatePrioritySelectionLocked(network string, candidates []*rankedNode, byTag map[string]*rankedNode, current adapter.Outbound, now time.Time) {
+	var incumbent *rankedNode
+	if current != nil {
+		if node, loaded := byTag[current.Tag()]; loaded && s.qualifies(node) {
+			incumbent = node
+		}
+	}
+	if incumbent == nil {
+		s.setSelectedLocked(s.outbounds[candidates[0].tag], network, "best available", now, true)
+		return
+	}
+	var best *rankedNode
+	for _, node := range candidates {
+		if node.priority < incumbent.priority && node.settled {
+			s.setSelectedLocked(s.outbounds[node.tag], network, "back to a higher priority", now, s.failbackInterrupt)
+			return
+		}
+		if best == nil && node.priority == incumbent.priority {
+			best = node
+		}
+	}
+	if best == nil || incumbent.stats.Average <= best.stats.Average+s.tolerance {
+		return
+	}
+	s.setSelectedLocked(s.outbounds[best.tag], network, "best available", now, true)
 }
 
 func (s *AutoSelector) selectedFor(network string) adapter.Outbound {
@@ -1381,22 +1613,42 @@ func (s *AutoSelector) setSelectedLocked(detour adapter.Outbound, network string
 	if previous != nil && s.started {
 		s.logger.Info("auto-selector: ", network, " ", previous.Tag(), " -> ", detour.Tag(), " (", reason, ")")
 		if interruptExisting {
-			s.interruptGroup.Interrupt(s.interruptExternalConnections)
+			s.interruptOwnLocked()
 			s.attachedGroup.Interrupt(s.interruptExternalConnections)
 		}
 	}
 }
 
+// interruptOwnLocked closes the connections the group dialed itself. They report no passive outcome, since the
+// selector closed them rather than their member.
+func (s *AutoSelector) interruptOwnLocked() {
+	s.interrupting.Store(true)
+	s.interruptGroup.Interrupt(s.interruptExternalConnections)
+	s.interrupting.Store(false)
+}
+
 // --------------------------------------------------------------- dialling ---
 
 // pick returns the outbound to attempt next for a dial, skipping anything
-// already tried on this dial. It walks selection -> qualified -> ranked, and
-// only as a last resort reaches into members that are in cooldown.
-func (s *AutoSelector) pick(network string, tried map[string]bool) adapter.Outbound {
+// already tried on this dial. steered reports a member chosen on purpose rather
+// than as the selection or its failover: a balanced pick, or a site moved off a
+// member it failed on. A steered dial that succeeds leaves the selection alone.
+func (s *AutoSelector) pick(network string, site string, tried map[string]bool) (detour adapter.Outbound, steered bool) {
 	s.access.Lock()
 	defer s.access.Unlock()
 	now := time.Now()
+	detour, steered = s.pickLocked(network, tried, now)
+	if detour != nil && site != "" && s.passive {
+		if other := s.steerSiteLocked(network, site, detour, tried, now); other != nil {
+			return other, true
+		}
+	}
+	return detour, steered
+}
 
+// pickLocked walks selection -> qualified -> ranked, and only as a last resort
+// reaches into members that are in cooldown.
+func (s *AutoSelector) pickLocked(network string, tried map[string]bool, now time.Time) (adapter.Outbound, bool) {
 	// Balancing and a pinned member are contradictory instructions; the explicit
 	// one wins. Spreading traffic resumes by itself once the pin is released or
 	// the member stops being healthy.
@@ -1404,35 +1656,35 @@ func (s *AutoSelector) pick(network string, tried map[string]bool) adapter.Outbo
 	if balancing && s.balanceMode == BalanceModeRotate && now.After(s.nextRotateAt) {
 		s.rotateLocked(network, now)
 	}
-	if balancing && s.balanceMode == BalanceModeConnection && len(s.qualified) > 1 {
-		if detour := s.pickRandomQualifiedLocked(network, tried, now); detour != nil {
-			return detour
+	if balancing && s.balanceMode == BalanceModeConnection {
+		if detour := s.pickBalancedLocked(network, tried, now); detour != nil {
+			return detour, true
 		}
 	}
 
 	if current := s.selectedFor(network); current != nil && !tried[current.Tag()] {
 		if health, loaded := s.members[current.Tag()]; !loaded || !health.inCooldown(now) {
-			return current
+			return current, false
 		}
 	}
 	for _, tag := range s.qualified {
 		if detour := s.usableLocked(tag, network, tried, now, false); detour != nil {
-			return detour
+			return detour, false
 		}
 	}
 	for _, node := range s.ranked {
 		if detour := s.usableLocked(node.tag, network, tried, now, false); detour != nil {
-			return detour
+			return detour, false
 		}
 	}
 	// Everything is cooling down. Better to retry a penalised member than to
 	// hand the client a failure.
 	for _, node := range s.ranked {
 		if detour := s.usableLocked(node.tag, network, tried, now, true); detour != nil {
-			return detour
+			return detour, false
 		}
 	}
-	return nil
+	return nil, false
 }
 
 func (s *AutoSelector) usableLocked(tag string, network string, tried map[string]bool, now time.Time, ignoreCooldown bool) adapter.Outbound {
@@ -1451,9 +1703,13 @@ func (s *AutoSelector) usableLocked(tag string, network string, tried map[string
 	return detour
 }
 
-func (s *AutoSelector) pickRandomQualifiedLocked(network string, tried map[string]bool, now time.Time) adapter.Outbound {
-	candidates := make([]adapter.Outbound, 0, len(s.qualified))
-	for _, tag := range s.qualified {
+func (s *AutoSelector) pickBalancedLocked(network string, tried map[string]bool, now time.Time) adapter.Outbound {
+	members := s.balanceSetLocked(network)
+	if len(members) < 2 {
+		return nil
+	}
+	candidates := make([]adapter.Outbound, 0, len(members))
+	for _, tag := range members {
 		if detour := s.usableLocked(tag, network, tried, now, false); detour != nil {
 			candidates = append(candidates, detour)
 		}
@@ -1462,6 +1718,23 @@ func (s *AutoSelector) pickRandomQualifiedLocked(network string, tried map[strin
 		return nil
 	}
 	return candidates[rand.Intn(len(candidates))]
+}
+
+// balanceSetLocked is what balancing spreads over: the qualified members, kept to the tier in use under the
+// priority strategy so traffic never leaks into a lower one.
+func (s *AutoSelector) balanceSetLocked(network string) []string {
+	current := s.selectedFor(network)
+	if s.strategy != StrategyPriority || current == nil {
+		return s.qualified
+	}
+	top := s.priority[current.Tag()]
+	members := make([]string, 0, len(s.qualified))
+	for _, tag := range s.qualified {
+		if s.priority[tag] == top {
+			members = append(members, tag)
+		}
+	}
+	return members
 }
 
 // rotateLocked advances balance mode to the next qualified member. Rotating the
@@ -1474,21 +1747,22 @@ func (s *AutoSelector) pickRandomQualifiedLocked(network string, tried map[strin
 // more disruptive than the failover it is not.
 func (s *AutoSelector) rotateLocked(network string, now time.Time) {
 	s.nextRotateAt = now.Add(s.balanceInterval)
-	if len(s.qualified) < 2 {
+	members := s.balanceSetLocked(network)
+	if len(members) < 2 {
 		return
 	}
 	current := s.selectedFor(network)
 	start := 0
 	if current != nil {
-		for i, tag := range s.qualified {
+		for i, tag := range members {
 			if tag == current.Tag() {
 				start = i + 1
 				break
 			}
 		}
 	}
-	for i := 0; i < len(s.qualified); i++ {
-		tag := s.qualified[(start+i)%len(s.qualified)]
+	for i := 0; i < len(members); i++ {
+		tag := members[(start+i)%len(members)]
 		if detour := s.usableLocked(tag, network, nil, now, false); detour != nil {
 			s.setSelectedLocked(detour, network, "balance rotation", now, false)
 			return
@@ -1496,11 +1770,12 @@ func (s *AutoSelector) rotateLocked(network string, now time.Time) {
 	}
 }
 
-// noteDialResult feeds the passive health signal. A failure demotes the member
+// noteDialResult feeds the dial signal. A failure demotes the member
 // immediately so the very next attempt goes elsewhere; a success clears the
 // penalty and promotes the member that actually worked, so Selected() — and with
-// it traffic accounting — tracks reality.
-func (s *AutoSelector) noteDialResult(detour adapter.Outbound, network string, err error) {
+// it traffic accounting — tracks reality. A steered dial chose its member on
+// purpose, so its success promotes nothing.
+func (s *AutoSelector) noteDialResult(detour adapter.Outbound, network string, site string, steered bool, err error) {
 	now := time.Now()
 	tag := detour.Tag()
 
@@ -1510,14 +1785,14 @@ func (s *AutoSelector) noteDialResult(detour adapter.Outbound, network string, e
 			health.reward(now)
 		}
 		delete(s.recentDialFails, tag)
-		if current := s.selectedFor(network); current == nil || current.Tag() != tag {
+		if current := s.selectedFor(network); !steered && (current == nil || current.Tag() != tag) {
 			// The member we moved off just failed to dial, so its live
 			// connections are already broken; honouring the interrupt setting
 			// here gets clients off it instead of leaving them hanging.
 			// Attached connections are spared, see AttachConnection.
 			s.setSelectedLocked(detour, network, "failover succeeded", now, false)
 			if current != nil && s.started {
-				s.interruptGroup.Interrupt(s.interruptExternalConnections)
+				s.interruptOwnLocked()
 			}
 		}
 		s.access.Unlock()
@@ -1540,6 +1815,10 @@ func (s *AutoSelector) noteDialResult(detour adapter.Outbound, network string, e
 	if !suspended {
 		if health, loaded := s.members[tag]; loaded {
 			health.penalize(now, dialBackoff, err)
+			// The cooldown moves traffic off at once; a suspicion outlasts it when the member keeps failing.
+			if s.passive && s.notePassiveFailureLocked(health, site, now) {
+				s.evaluateLocked(now)
+			}
 		}
 		s.recentDialFails[tag] = now
 		for failedTag, at := range s.recentDialFails {
@@ -1583,20 +1862,27 @@ func (s *AutoSelector) DialContext(ctx context.Context, network string, destinat
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
 	tried := make(map[string]bool, s.dialRetries+1)
+	var site string
+	if s.passive {
+		site = siteOf(ctx, destination)
+	}
 	var lastError error
 	for attempt := 0; attempt <= s.dialRetries; attempt++ {
-		detour := s.pick(N.NetworkName(network), tried)
+		detour, steered := s.pick(N.NetworkName(network), site, tried)
 		if detour == nil {
 			break
 		}
 		tried[detour.Tag()] = true
 		conn, err := detour.DialContext(ctx, network, destination)
 		if err == nil {
-			s.noteDialResult(detour, N.NetworkName(network), nil)
+			s.noteDialResult(detour, N.NetworkName(network), site, steered, nil)
+			if s.passive {
+				conn = s.passiveConn(conn, detour.Tag(), site, N.NetworkName(network) == N.NetworkUDP)
+			}
 			return s.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 		}
 		lastError = err
-		s.noteDialResult(detour, N.NetworkName(network), err)
+		s.noteDialResult(detour, N.NetworkName(network), site, steered, err)
 		s.logger.DebugContext(ctx, "auto-selector: ", detour.Tag(), " failed: ", err)
 		if ctx.Err() != nil {
 			break
@@ -1610,20 +1896,27 @@ func (s *AutoSelector) DialContext(ctx context.Context, network string, destinat
 
 func (s *AutoSelector) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	tried := make(map[string]bool, s.dialRetries+1)
+	var site string
+	if s.passive {
+		site = siteOf(ctx, destination)
+	}
 	var lastError error
 	for attempt := 0; attempt <= s.dialRetries; attempt++ {
-		detour := s.pick(N.NetworkUDP, tried)
+		detour, steered := s.pick(N.NetworkUDP, site, tried)
 		if detour == nil {
 			break
 		}
 		tried[detour.Tag()] = true
 		conn, err := detour.ListenPacket(ctx, destination)
 		if err == nil {
-			s.noteDialResult(detour, N.NetworkUDP, nil)
+			s.noteDialResult(detour, N.NetworkUDP, site, steered, nil)
+			if s.passive {
+				conn = s.passivePacketConn(conn, detour.Tag(), site)
+			}
 			return s.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 		}
 		lastError = err
-		s.noteDialResult(detour, N.NetworkUDP, err)
+		s.noteDialResult(detour, N.NetworkUDP, site, steered, err)
 		if ctx.Err() != nil {
 			break
 		}
@@ -1644,7 +1937,7 @@ func (s *AutoSelector) DialFailed(detour adapter.Outbound, network string, err e
 	if !loaded {
 		return
 	}
-	s.noteDialResult(member, network, err)
+	s.noteDialResult(member, network, "", false, err)
 }
 
 // memberHandle carries a member's identity, so routing, traffic accounting and the clash API see the member, while
@@ -1720,6 +2013,10 @@ func (s *AutoSelector) Status() AutoSelectorStatus {
 		Selected:         selectedTCP,
 		SelectedUDP:      selectedUDP,
 		Pinned:           s.pinnedTag,
+		Strategy:         s.strategy,
+		FailbackChecks:   s.failbackChecks,
+		FailbackDelay:    s.failbackDelay,
+		Passive:          s.passive,
 		Balance:          s.balance,
 		BalanceMode:      s.balanceMode,
 		Suspended:        s.suspended,
@@ -1744,6 +2041,11 @@ func (s *AutoSelector) Status() AutoSelectorStatus {
 	default:
 		status.Phase = "ready"
 	}
+	for _, record := range s.sites {
+		if record.member != "" && now.Sub(record.answered) < s.siteMemory {
+			status.SitesRemembered++
+		}
+	}
 
 	for rank, node := range s.ranked {
 		health, loaded := s.members[node.tag]
@@ -1751,6 +2053,11 @@ func (s *AutoSelector) Status() AutoSelectorStatus {
 			continue
 		}
 		stats := health.stats(now)
+		recentAnswered, recentFailed := health.passive.recent(now)
+		var suspectUntil time.Time
+		if health.passive.suspect(now) {
+			suspectUntil = health.passive.suspectUntil
+		}
 		if stats.All > 0 {
 			status.MembersProbed++
 		}
@@ -1781,6 +2088,16 @@ func (s *AutoSelector) Status() AutoSelectorStatus {
 			LastProbe:     health.lastProbe,
 			CooldownUntil: health.cooldownUntil,
 			LastError:     health.lastDialErr,
+			Priority:      s.priority[node.tag],
+			Streak:        health.streak(),
+			LastFailure:   health.lastFailure,
+
+			FirstByteMs:     int(health.passive.firstByte / time.Millisecond),
+			PassiveAnswered: health.passive.answered,
+			PassiveFailed:   health.passive.failed,
+			RecentAnswered:  recentAnswered,
+			RecentFailed:    recentFailed,
+			SuspectUntil:    suspectUntil,
 		})
 	}
 	return status
