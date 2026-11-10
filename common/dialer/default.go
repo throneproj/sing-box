@@ -54,6 +54,7 @@ type DefaultDialer struct {
 	fallbackNetworkType    []C.InterfaceType
 	networkFallbackDelay   time.Duration
 	networkLastFallback    common.TypedValue[time.Time]
+	quicOpener             bool
 }
 
 func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDialer, error) {
@@ -290,6 +291,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		networkType:            networkType,
 		fallbackNetworkType:    fallbackNetworkType,
 		networkFallbackDelay:   networkFallbackDelay,
+		quicOpener:             options.QUICOpener,
 	}
 	defaultDialer.canUseNetworkStrategy.Store(true)
 	return defaultDialer, nil
@@ -346,6 +348,9 @@ func (d *DefaultDialer) DialContext(ctx context.Context, network string, address
 				return DialSlowContext(&d.dialer6, ctx, d.netns, network, address)
 			}
 		})
+		if err == nil && d.quicOpener && N.NetworkName(network) == N.NetworkUDP {
+			writeQUICOpener(conn)
+		}
 		return d.trackConn(ctx, address, conn, err)
 	} else {
 		return d.DialParallelNetwork(ctx, network, address, nil, nil, nil, nil, 0)
@@ -407,6 +412,9 @@ func (d *DefaultDialer) DialParallelNetwork(ctx context.Context, network string,
 	if !fastFallback && !isPrimary {
 		d.networkLastFallback.Store(time.Now())
 	}
+	if d.quicOpener && N.NetworkName(network) == N.NetworkUDP {
+		writeQUICOpener(conn)
+	}
 	return conn, nil
 }
 
@@ -430,6 +438,9 @@ func (d *DefaultDialer) ListenPacket(ctx context.Context, destination M.Socksadd
 				return listenConfig.ListenPacket(ctx, N.NetworkUDP, d.udpAddr4)
 			}
 		})
+		if err == nil && d.quicOpener {
+			writeQUICOpenerTo(packetConn, destination)
+		}
 		return d.trackPacketConn(ctx, destination, packetConn, err)
 	} else {
 		return d.listenSerialInterfacePacket(ctx, destination, nil, nil, nil)
@@ -494,6 +505,9 @@ func (d *DefaultDialer) listenSerialInterfacePacket(ctx context.Context, destina
 		} else {
 			return nil, err
 		}
+	}
+	if d.quicOpener {
+		writeQUICOpenerTo(packetConn, destination)
 	}
 	return d.trackPacketConn(ctx, destination, packetConn, nil)
 }
