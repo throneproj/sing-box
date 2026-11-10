@@ -92,7 +92,7 @@ func TestSortTiersDeadBelowUntested(t *testing.T) {
 	cooldown := &rankedNode{tag: "cooldown", tier: tierCooldown}
 
 	nodes := []*rankedNode{dead, cooldown, untested, healthy}
-	sortNodes(nodes)
+	sortNodes(nodes, false)
 
 	want := []string{"healthy", "untested", "dead", "cooldown"}
 	for i, node := range nodes {
@@ -107,7 +107,7 @@ func TestSortPrefersStabilityOverRawSpeed(t *testing.T) {
 	steady := &rankedNode{tag: "steady", tier: tierHealthy, stats: memberStats{All: 10, Average: 150 * time.Millisecond, Deviation: 10 * time.Millisecond}}
 
 	nodes := []*rankedNode{jittery, steady}
-	sortNodes(nodes)
+	sortNodes(nodes, false)
 	if nodes[0].tag != "steady" {
 		t.Fatalf("first = %q, want steady", nodes[0].tag)
 	}
@@ -238,7 +238,7 @@ func TestStableByPriorKeepsEqualMembersInPlace(t *testing.T) {
 		{tag: "c", tier: tierHealthy, stats: memberStats{All: 5, Average: 100 * time.Millisecond, Deviation: 10 * time.Millisecond}},
 	}
 	stableByPrior(nodes, prior)
-	sortNodes(nodes)
+	sortNodes(nodes, false)
 
 	// b ranked above a last round and is exactly as good this round, so it must
 	// stay ahead; c has no prior and sorts last.
