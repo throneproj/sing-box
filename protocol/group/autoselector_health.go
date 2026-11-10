@@ -73,6 +73,9 @@ type memberHealth struct {
 	lastOK    time.Time
 	lastProbe time.Time
 	probes    int
+	// The most recent failed probe or dial. Unlike the cooldown it survives a
+	// success, since fail-back counts the checks passed after it.
+	lastFailure time.Time
 
 	// Cooldown after consecutive dial failures. cooldownAt records when the
 	// penalty was applied so an outage detected moments later can roll it back
@@ -80,6 +83,8 @@ type memberHealth struct {
 	cooldownUntil time.Time
 	cooldownAt    time.Time
 	cooldownStep  int
+
+	passive passiveHealth
 }
 
 func newMemberHealth(tag string, capacity int, validity time.Duration) *memberHealth {
@@ -101,8 +106,18 @@ func (h *memberHealth) put(value time.Duration, at time.Time) {
 	h.samples[h.idx] = pingSample{at: at, value: value}
 	h.probes++
 	h.lastProbe = at
-	if value != rttFailed && value != rttUntested {
+	switch value {
+	case rttFailed:
+		h.noteFailure(at)
+	case rttUntested:
+	default:
 		h.lastOK = at
+	}
+}
+
+func (h *memberHealth) noteFailure(at time.Time) {
+	if at.After(h.lastFailure) {
+		h.lastFailure = at
 	}
 }
 
@@ -118,7 +133,36 @@ func (h *memberHealth) rollbackFailuresSince(since time.Time) int {
 			rolled++
 		}
 	}
+	if !h.lastFailure.Before(since) {
+		// Only the ring remembers earlier failures; a dial failure before the window is forgotten.
+		h.lastFailure = time.Time{}
+		for _, s := range h.samples {
+			if s.value == rttFailed {
+				h.noteFailure(s.at)
+			}
+		}
+	}
 	return rolled
+}
+
+// streak counts the successful checks recorded since the last failure.
+func (h *memberHealth) streak() int {
+	count := 0
+	for _, s := range h.samples {
+		if s.value != rttFailed && s.value != rttUntested && s.at.After(h.lastFailure) {
+			count++
+		}
+	}
+	return count
+}
+
+// settled reports whether a member has proven its recovery for long enough to
+// be moved back up to. One that never failed has nothing to prove.
+func (h *memberHealth) settled(now time.Time, checks int, delay time.Duration) bool {
+	if h.lastFailure.IsZero() {
+		return true
+	}
+	return now.Sub(h.lastFailure) >= delay && h.streak() >= checks
 }
 
 // rollbackSince reports how far back an outage invalidates what was measured:
@@ -200,6 +244,7 @@ func (h *memberHealth) penalize(now time.Time, backoff []time.Duration, err erro
 	if h.cooldownStep < len(backoff)-1 {
 		h.cooldownStep++
 	}
+	h.noteFailure(now)
 }
 
 // reward clears the penalty state after a dial succeeds.
@@ -237,11 +282,19 @@ type rankedNode struct {
 	tag   string
 	tier  int
 	stats memberStats
+	// Set under the priority strategy only.
+	priority int
+	settled  bool
+	// Passive scoring holds the member out of the selection.
+	suspect bool
 }
 
 func (n *rankedNode) state() string {
 	switch n.tier {
 	case tierHealthy:
+		if n.suspect {
+			return "suspect"
+		}
 		if n.stats.Fail > 0 {
 			return "degraded"
 		}
@@ -270,12 +323,25 @@ func stableByPrior(nodes []*rankedNode, prior map[string]int) {
 }
 
 // sortNodes orders by tier, then by the least-load comparators: deviation first
-// (stability beats raw speed), then average, then failures.
-func sortNodes(nodes []*rankedNode) {
+// (stability beats raw speed), then average, then failures. Suspect members
+// follow the other healthy ones. byPriority puts settled healthy members first,
+// then orders every tier by priority.
+func sortNodes(nodes []*rankedNode, byPriority bool) {
 	sort.SliceStable(nodes, func(i, j int) bool {
 		l, r := nodes[i], nodes[j]
 		if l.tier != r.tier {
 			return l.tier < r.tier
+		}
+		if l.tier == tierHealthy && l.suspect != r.suspect {
+			return r.suspect
+		}
+		if byPriority {
+			if l.tier == tierHealthy && l.settled != r.settled {
+				return l.settled
+			}
+			if l.priority != r.priority {
+				return l.priority < r.priority
+			}
 		}
 		if l.tier != tierHealthy {
 			// Nothing meaningful to compare below the healthy tier; keep the
