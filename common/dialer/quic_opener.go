@@ -14,6 +14,19 @@ const (
 	quicOpenerCIDLen  = 8
 )
 
+var _ QUICOpenerDialer = (*DefaultDialer)(nil)
+
+type QUICOpenerDialer interface {
+	QUICOpener() func() []byte
+}
+
+func (d *DefaultDialer) QUICOpener() func() []byte {
+	if !d.quicOpener {
+		return nil
+	}
+	return newQUICOpener
+}
+
 // DPI that keys a UDP flow on its first packet's QUIC version lets the flow through after a v2 decoy.
 func newQUICOpener() []byte {
 	packet := make([]byte, quicOpenerLength)

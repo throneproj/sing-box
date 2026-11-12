@@ -166,6 +166,13 @@ func (e *Endpoint) Start(postStart bool) error {
 		if e.options.ListenPort == 0 && len(e.peers) == 1 && e.peers[0].endpoint.IsValid() {
 			standardBind.SetSinglePeerMode()
 		}
+		quicOpenerDialer, isQUICOpenerDialer := common.Cast[dialer.QUICOpenerDialer](e.options.Dialer)
+		if isQUICOpenerDialer {
+			newOpener := quicOpenerDialer.QUICOpener()
+			if newOpener != nil {
+				standardBind.SetFlowOpener(newOpener)
+			}
+		}
 		if egressEnabled {
 			egressPoolOptions := e.options.EgressPoolOptions
 			egressPoolOptions.Control = listenerControl
