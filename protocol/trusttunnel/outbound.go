@@ -3,28 +3,22 @@ package trusttunnel
 import (
 	"context"
 	"net"
-	"net/netip"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/dialer"
+	"github.com/sagernet/sing-box/common/iponly"
 	"github.com/sagernet/sing-box/common/tls"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing/common/auth"
+	"github.com/sagernet/sing-box/transport/trusttunnel"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
-
-	"github.com/xchacha20-poly1305/sing-trusttunnel"
 )
-
-func init() {
-	trusttunnel.ErrQUICNotIncluded = C.ErrQUICNotIncluded
-}
 
 func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.TrustTunnelOutboundOptions](registry, C.TypeTrustTunnel, NewOutbound)
@@ -34,7 +28,6 @@ var _ adapter.InterfaceUpdateListener = (*Outbound)(nil)
 
 type Outbound struct {
 	outbound.Adapter
-	ctx       context.Context
 	logger    log.ContextLogger
 	client    *trusttunnel.Client
 	dnsRouter adapter.DNSRouter
@@ -47,12 +40,14 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if options.Username == "" || options.Password == "" {
 		return nil, E.New("require auth")
 	}
-	detour, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
+	if options.ClientRandom != "" && options.ClientRandomAuthKey != "" {
+		return nil, E.New("client_random and client_random_auth_key are mutually exclusive")
+	}
+	outboundDialer, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
 	if err != nil {
 		return nil, err
 	}
-	server := options.ServerOptions.Build()
-	tlsConfig, err := tls.NewClient(ctx, logger, server.String(), *options.TLS)
+	tlsConfig, err := tls.NewClient(ctx, logger, options.Server, *options.TLS)
 	if err != nil {
 		return nil, err
 	}
@@ -67,37 +62,36 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		if err != nil {
 			return nil, err
 		}
+	} else if options.ClientRandomAuthKey != "" {
+		serverName := options.CustomSNI
+		if serverName == "" {
+			serverName = tlsConfig.ServerName()
+		}
+		tlsConfig, err = newClientRandomAuthKeyConfig(tlsConfig, options.ClientRandomAuthKey, serverName, *options.TLS)
+		if err != nil {
+			return nil, err
+		}
 	}
-	dnsRouter := service.FromContext[adapter.DNSRouter](ctx)
 	client, err := trusttunnel.NewClient(trusttunnel.ClientOptions{
-		Ctx:    ctx,
-		Detour: detour,
-		Server: server,
-		Auth: auth.User{
-			Username: options.Username,
-			Password: options.Password,
-		},
+		Context:               ctx,
+		Logger:                logger,
+		Dialer:                outboundDialer,
+		Server:                options.ServerOptions.Build(),
 		TLSConfig:             tlsConfig,
+		Username:              options.Username,
+		Password:              options.Password,
 		QUIC:                  options.QUIC,
 		QUICCongestionControl: options.QUICCongestionControl,
 		HealthCheck:           options.HealthCheck,
-		ResolveFunc: func(fqdn string) (netip.Addr, error) {
-			addresses, lookupErr := dnsRouter.Lookup(ctx, fqdn, adapter.DNSQueryOptions{})
-			if lookupErr != nil {
-				return netip.Addr{}, lookupErr
-			}
-			return addresses[0], nil
-		},
 	})
 	if err != nil {
 		return nil, err
 	}
 	return &Outbound{
 		Adapter:   outbound.NewAdapterWithDialerOptions(C.TypeTrustTunnel, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
-		ctx:       ctx,
 		logger:    logger,
 		client:    client,
-		dnsRouter: dnsRouter,
+		dnsRouter: service.FromContext[adapter.DNSRouter](ctx),
 	}, nil
 }
 
@@ -114,24 +108,14 @@ func (h *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	switch network {
+	switch N.NetworkName(network) {
 	case N.NetworkTCP:
 		ctx, metadata := adapter.ExtendContext(ctx)
 		metadata.Outbound = h.Tag()
 		metadata.Destination = destination
 		h.logger.InfoContext(ctx, "outbound connection to ", destination)
-		return h.client.Dial(ctx, destination)
+		return h.client.DialContext(ctx, destination)
 	case N.NetworkUDP:
-		if destination.IsDomain() {
-			addresses, err := h.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
-			if err != nil {
-				return nil, err
-			}
-			destination = M.Socksaddr{
-				Addr: addresses[0],
-				Port: destination.Port,
-			}
-		}
 		packetConn, err := h.ListenPacket(ctx, destination)
 		if err != nil {
 			return nil, err
@@ -147,7 +131,22 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
-	return h.client.ListenPacket(ctx)
+	if destination.IsDomain() {
+		destinationAddresses, err := h.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
+		if err != nil {
+			return nil, err
+		}
+		packetConn, err := h.client.ListenPacket(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return bufio.NewNATPacketConn(bufio.NewPacketConn(iponly.NewPacketConn(h.logger, packetConn)), M.SocksaddrFrom(destinationAddresses[0], destination.Port), destination), nil
+	}
+	packetConn, err := h.client.ListenPacket(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return iponly.NewPacketConn(h.logger, packetConn), nil
 }
 
 func (h *Outbound) InterfaceUpdated(ctx context.Context) {

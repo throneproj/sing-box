@@ -13,6 +13,7 @@ import (
 
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/transport/trusttunnel"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/json/badoption"
 	"github.com/sagernet/sing/common/logger"
@@ -20,7 +21,6 @@ import (
 	N "github.com/sagernet/sing/common/network"
 
 	"github.com/stretchr/testify/require"
-	"github.com/xchacha20-poly1305/sing-trusttunnel"
 )
 
 func TestClientRandomThroughService(t *testing.T) {
@@ -89,18 +89,46 @@ func startClientRandomService(t *testing.T, listener net.Listener, packetConn ne
 	require.NoError(t, err)
 	keyLog := new(clientRandomKeyLog)
 	stdConfig.KeyLogWriter = keyLog
-	service := trusttunnel.NewService(trusttunnel.ServiceOptions{
-		Ctx:     t.Context(),
+	server := trusttunnel.NewServer(trusttunnel.ServerOptions{
+		Context: t.Context(),
 		Logger:  logger.NOP(),
-		Handler: new(echoHandler),
+		Users:   []auth.User{{Username: "sekai", Password: "password"}},
 	})
-	service.UpdateUsers([]auth.User{{Username: "sekai", Password: "password"}})
-	require.NoError(t, service.Start(listener, packetConn, serverConfig))
 	t.Cleanup(func() {
-		_ = service.Close()
 		_ = serverConfig.Close()
 	})
+	if listener != nil {
+		go serveClientRandomListener(t.Context(), server, listener, serverConfig)
+		t.Cleanup(func() {
+			_ = listener.Close()
+		})
+	}
+	if packetConn != nil {
+		http3Server, err := server.ListenHTTP3(packetConn, new(echoHandler), serverConfig)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_ = http3Server.Close()
+			_ = packetConn.Close()
+		})
+	}
 	return keyLog
+}
+
+func serveClientRandomListener(ctx context.Context, server *trusttunnel.Server, listener net.Listener, serverConfig tls.ServerConfig) {
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		go func() {
+			tlsConn, err := tls.ServerHandshake(ctx, conn, serverConfig)
+			if err != nil {
+				_ = conn.Close()
+				return
+			}
+			server.ServeConnection(ctx, tlsConn, new(echoHandler), M.SocksaddrFromNet(conn.RemoteAddr()), nil)
+		}()
+	}
 }
 
 func newClientRandomClient(t *testing.T, server M.Socksaddr, quic bool) *trusttunnel.Client {
@@ -108,11 +136,13 @@ func newClientRandomClient(t *testing.T, server M.Socksaddr, quic bool) *trusttu
 	config, err := newClientRandomConfig(newTestTLSConfig(t, option.OutboundTLSOptions{Insecure: true}), testClientRandom, option.OutboundTLSOptions{})
 	require.NoError(t, err)
 	client, err := trusttunnel.NewClient(trusttunnel.ClientOptions{
-		Ctx:       t.Context(),
-		Detour:    new(N.DefaultDialer),
+		Context:   t.Context(),
+		Logger:    logger.NOP(),
+		Dialer:    new(N.DefaultDialer),
 		Server:    server,
-		Auth:      auth.User{Username: "sekai", Password: "password"},
 		TLSConfig: config,
+		Username:  "sekai",
+		Password:  "password",
 		QUIC:      quic,
 	})
 	require.NoError(t, err)
@@ -125,7 +155,7 @@ func newClientRandomClient(t *testing.T, server M.Socksaddr, quic bool) *trusttu
 
 func requireEcho(t *testing.T, client *trusttunnel.Client) {
 	t.Helper()
-	conn, err := client.Dial(t.Context(), M.ParseSocksaddr("example.org:80"))
+	conn, err := client.DialContext(t.Context(), M.ParseSocksaddr("example.org:80"))
 	require.NoError(t, err)
 	defer conn.Close()
 	payload := []byte("client_random")

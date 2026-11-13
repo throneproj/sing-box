@@ -75,7 +75,7 @@ func InboundRegistry() *inbound.Registry {
 	vless.RegisterInbound(registry)
 	anytls.RegisterInbound(registry)
 	mieru.RegisterInbound(registry)
-	trusttunnel.RegistryInbound(registry)
+	trusttunnel.RegisterInbound(registry)
 
 	registerQUICInbounds(registry)
 	registerCloudflaredInbound(registry)

@@ -11,36 +11,35 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/transport/trusttunnel"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
 	E "github.com/sagernet/sing/common/exceptions"
-	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
-	"github.com/xchacha20-poly1305/sing-trusttunnel"
+	"golang.org/x/net/http2"
 )
 
-func RegistryInbound(registry *inbound.Registry) {
+func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.TrustTunnelInboundOptions](registry, C.TypeTrustTunnel, NewInbound)
 }
 
+var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
+
 type Inbound struct {
 	inbound.Adapter
-	ctx       context.Context
-	logger    log.ContextLogger
 	router    adapter.ConnectionRouterEx
+	logger    log.ContextLogger
 	listener  *listener.Listener
-	service   *trusttunnel.Service
+	server    *trusttunnel.Server
 	tlsConfig tls.ServerConfig
 	network   []string
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TrustTunnelInboundOptions) (adapter.Inbound, error) {
 	network := options.Network.Build()
-	if common.Contains(network, N.NetworkUDP) {
-		if options.TLS == nil || !options.TLS.Enabled {
-			return nil, C.ErrTLSRequired
-		}
+	if common.Contains(network, N.NetworkUDP) && (options.TLS == nil || !options.TLS.Enabled) {
+		return nil, C.ErrTLSRequired
 	}
 	if len(options.Users) == 0 {
 		return nil, E.New("missing users")
@@ -52,100 +51,94 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 	inbound := &Inbound{
 		Adapter: inbound.NewAdapter(C.TypeTrustTunnel, tag),
-		ctx:     ctx,
-		logger:  logger,
 		router:  router,
-		listener: listener.New(listener.Options{
-			Context: ctx,
-			Logger:  logger,
-			Listen:  options.ListenOptions,
+		logger:  logger,
+		server: trusttunnel.NewServer(trusttunnel.ServerOptions{
+			Context:               ctx,
+			Logger:                logger,
+			Users:                 options.Users,
+			QUICCongestionControl: options.QUICCongestionControl,
 		}),
 		network: network,
 	}
-	inbound.service = trusttunnel.NewService(trusttunnel.ServiceOptions{
-		Ctx:                   ctx,
-		Logger:                logger,
-		Handler:               inbound,
-		ICMPHandler:           nil,
-		QUICCongestionControl: options.QUICCongestionControl,
-	})
 	if options.TLS != nil {
 		tlsConfig, err := tls.NewServer(ctx, logger, common.PtrValueOrDefault(options.TLS))
 		if err != nil {
 			return nil, err
 		}
+		if tlsConfig != nil && common.Contains(network, N.NetworkTCP) && len(tlsConfig.NextProtos()) == 0 {
+			tlsConfig.SetNextProtos([]string{http2.NextProtoTLS})
+		}
 		inbound.tlsConfig = tlsConfig
 	}
-	inbound.service.UpdateUsers(options.Users)
+	var listenNetwork []string
+	if common.Contains(network, N.NetworkTCP) {
+		listenNetwork = []string{N.NetworkTCP}
+	}
+	inbound.listener = listener.New(listener.Options{
+		Context:           ctx,
+		Logger:            logger,
+		Network:           listenNetwork,
+		Listen:            options.ListenOptions,
+		ConnectionHandler: inbound,
+	})
 	return inbound, nil
 }
 
-func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) (err error) {
+func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
-		return
+		return nil
 	}
 	if h.tlsConfig != nil {
-		err = h.tlsConfig.Start()
+		err := h.tlsConfig.Start()
 		if err != nil {
-			err = E.Cause(err, "start TLS config")
-			return
+			return E.Cause(err, "create TLS config")
 		}
 		scope.Add(h.tlsConfig.Close)
 	}
-	var (
-		tcpListener net.Listener
-		udpConn     net.PacketConn
-	)
-	if common.Contains(h.network, N.NetworkTCP) {
-		tcpListener, err = h.listener.ListenTCP()
-		if err != nil {
-			return
-		}
-	}
+	scope.Add(h.listener.Close)
 	if common.Contains(h.network, N.NetworkUDP) {
-		udpConn, err = h.listener.ListenUDP()
+		udpConn, err := h.listener.ListenUDP()
 		if err != nil {
-			_ = common.Close(tcpListener)
-			return
+			return err
 		}
+		var metadata adapter.InboundContext
+		//nolint:staticcheck
+		metadata.InboundDetour = h.listener.ListenOptions().Detour
+		http3Server, err := h.server.ListenHTTP3(udpConn, adapter.NewUpstreamHandler(metadata, h.newUserConnection, h.newUserPacketConnection), h.tlsConfig)
+		if err != nil {
+			return err
+		}
+		scope.Add(http3Server.Close)
 	}
-	err = h.service.Start(tcpListener, udpConn, h.tlsConfig)
-	if err != nil {
-		_ = common.Close(tcpListener, udpConn)
-		return
-	}
-	scope.Add(h.service.Close)
-	return
+	return h.listener.Start()
 }
 
-func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
-	ctx = log.ContextWithNewID(ctx)
-	username, _ := auth.UserFromContext[string](ctx)
-	metadata := adapter.InboundContext{
-		Inbound:     h.Tag(),
-		InboundType: h.Type(),
-		//nolint:staticcheck
-		InboundDetour:     h.listener.ListenOptions().Detour,
-		OriginDestination: h.listener.UDPAddr(),
-		Source:            source,
-		Destination:       destination,
-		User:              username,
+func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	if h.tlsConfig != nil {
+		tlsConn, err := tls.ServerHandshake(ctx, conn, h.tlsConfig)
+		if err != nil {
+			N.CloseOnHandshakeFailure(conn, onClose, err)
+			h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source, ": TLS handshake"))
+			return
+		}
+		conn = tlsConn
 	}
+	h.server.ServeConnection(ctx, conn, adapter.NewUpstreamHandler(metadata, h.newUserConnection, h.newUserPacketConnection), metadata.Source, onClose)
+}
+
+func (h *Inbound) newUserConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	metadata.Inbound = h.Tag()
+	metadata.InboundType = h.Type()
+	metadata.User, _ = auth.UserFromContext[string](ctx)
+	h.logger.InfoContext(ctx, "[", metadata.User, "] inbound connection to ", metadata.Destination)
 	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }
 
-func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
-	ctx = log.ContextWithNewID(ctx)
-	username, _ := auth.UserFromContext[string](ctx)
-	metadata := adapter.InboundContext{
-		Inbound:     h.Tag(),
-		InboundType: h.Type(),
-		//nolint:staticcheck
-		InboundDetour: h.listener.ListenOptions().Detour,
-		//nolint:staticcheck
-		Source:      source,
-		Destination: destination,
-		User:        username,
-	}
+func (h *Inbound) newUserPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	metadata.Inbound = h.Tag()
+	metadata.InboundType = h.Type()
+	metadata.User, _ = auth.UserFromContext[string](ctx)
+	h.logger.InfoContext(ctx, "[", metadata.User, "] inbound packet connection to ", metadata.Destination)
 	h.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
 }

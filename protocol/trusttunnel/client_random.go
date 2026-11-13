@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"io"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -16,27 +17,20 @@ import (
 const clientRandomLength = 32
 
 // clientRandomConfig makes every new TLS or QUIC connection send a ClientHello
-// random matching the client_random prefix and mask required by the server.
+// random the server accepts, as required by client_random or
+// client_random_auth_key.
 //
 // crypto/tls and uTLS take the ClientHello random from the config's entropy
-// source, so every connection gets its own clientRandomReader.
+// source, so every connection gets its own reader.
 type clientRandomConfig struct {
 	tls.Config
-	prefix []byte
-	mask   []byte
+	newReader func() io.Reader
 }
 
 func newClientRandomConfig(config tls.Config, clientRandom string, tlsOptions option.OutboundTLSOptions) (tls.Config, error) {
-	if tlsOptions.ECH != nil && tlsOptions.ECH.Enabled {
-		// The random of the inner ClientHello is not the one sent on the wire.
-		return nil, E.New("client_random is not compatible with ECH")
-	}
-	if tlsOptions.UTLS != nil && tlsOptions.UTLS.Enabled && tlsOptions.UTLS.Fingerprint == "custom" {
-		// The padded ClientHello is rebuilt with a fresh random during the handshake.
-		return nil, E.New("client_random is not compatible with the custom uTLS fingerprint")
-	}
-	if _, isRandCapable := config.(tls.RandCapableConfig); !isRandCapable {
-		return nil, E.New("client_random is not compatible with REALITY or the system TLS engines")
+	err := checkClientRandomConfig(config, tlsOptions, "client_random")
+	if err != nil {
+		return nil, err
 	}
 	prefix, mask, err := parseClientRandom(clientRandom)
 	if err != nil {
@@ -44,9 +38,25 @@ func newClientRandomConfig(config tls.Config, clientRandom string, tlsOptions op
 	}
 	return &clientRandomConfig{
 		Config: config,
-		prefix: prefix,
-		mask:   mask,
+		newReader: func() io.Reader {
+			return &clientRandomReader{prefix: prefix, mask: mask}
+		},
 	}, nil
+}
+
+func checkClientRandomConfig(config tls.Config, tlsOptions option.OutboundTLSOptions, optionName string) error {
+	if tlsOptions.ECH != nil && tlsOptions.ECH.Enabled {
+		// The random of the inner ClientHello is not the one sent on the wire.
+		return E.New(optionName, " is not compatible with ECH")
+	}
+	if tlsOptions.UTLS != nil && tlsOptions.UTLS.Enabled && tlsOptions.UTLS.Fingerprint == "custom" {
+		// The padded ClientHello is rebuilt with a fresh random during the handshake.
+		return E.New(optionName, " is not compatible with the custom uTLS fingerprint")
+	}
+	if _, isRandCapable := config.(tls.RandCapableConfig); !isRandCapable {
+		return E.New(optionName, " is not compatible with REALITY or the system TLS engines")
+	}
+	return nil
 }
 
 func (c *clientRandomConfig) Client(conn net.Conn) (tls.Conn, error) {
@@ -67,14 +77,9 @@ func (c *clientRandomConfig) STDConfig() (*tls.STDConfig, error) {
 
 func (c *clientRandomConfig) Clone() tls.Config {
 	return &clientRandomConfig{
-		Config: c.Config.Clone(),
-		prefix: c.prefix,
-		mask:   c.mask,
+		Config:    c.Config.Clone(),
+		newReader: c.newReader,
 	}
-}
-
-func (c *clientRandomConfig) newReader() *clientRandomReader {
-	return &clientRandomReader{prefix: c.prefix, mask: c.mask}
 }
 
 // parseClientRandom parses the TrustTunnel prefix[/mask] hex syntax, an omitted
