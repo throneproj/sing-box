@@ -17,7 +17,6 @@ func TestClientRandomThroughQUICService(t *testing.T) {
 	require.NoError(t, err)
 	keyLog := startClientRandomService(t, nil, packetConn)
 	client := newClientRandomClient(t, M.ParseSocksaddr(packetConn.LocalAddr().String()), true)
-	// Only one connection: ResetConnections closes the client's http3.Transport for good.
 	requireEcho(t, client)
 	requireServerClientRandoms(t, keyLog, 1)
 }

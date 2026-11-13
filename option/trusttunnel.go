@@ -22,5 +22,6 @@ type TrustTunnelOutboundOptions struct {
 	QUICCongestionControl string `json:"quic_congestion_control,omitempty"`
 	CustomSNI             string `json:"custom_sni,omitempty"`
 	ClientRandom          string `json:"client_random,omitempty"`
+	ClientRandomAuthKey   string `json:"client_random_auth_key,omitempty"`
 	OutboundTLSOptionsContainer
 }
