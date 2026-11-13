@@ -13,13 +13,13 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/transport/juicity"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
-	"github.com/exclavenetwork/sing-juicity"
 	"github.com/gofrs/uuid/v5"
 )
 
@@ -38,7 +38,6 @@ type Inbound struct {
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.JuicityInboundOptions) (adapter.Inbound, error) {
-	options.UDPFragmentDefault = true
 	if options.TLS == nil || !options.TLS.Enabled {
 		return nil, C.ErrTLSRequired
 	}
@@ -69,7 +68,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 	var userList []int
 	var userNameList []string
-	var userUUIDList [][uuid.Size]byte
+	var userUUIDList [][16]byte
 	var userPasswordList []string
 	for index, user := range options.Users {
 		if user.UUID == "" {
@@ -97,6 +96,7 @@ func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	metadata.InboundType = h.Type()
 	//nolint:staticcheck
 	metadata.InboundDetour = h.listener.ListenOptions().Detour
+	//nolint:staticcheck
 	metadata.OriginDestination = h.listener.UDPAddr()
 	metadata.Source = source
 	metadata.Destination = destination
@@ -118,6 +118,7 @@ func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	metadata.InboundType = h.Type()
 	//nolint:staticcheck
 	metadata.InboundDetour = h.listener.ListenOptions().Detour
+	//nolint:staticcheck
 	metadata.OriginDestination = h.listener.UDPAddr()
 	metadata.Source = source
 	metadata.Destination = destination

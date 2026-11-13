@@ -18,7 +18,8 @@ type JuicityUser struct {
 type JuicityOutboundOptions struct {
 	DialerOptions
 	ServerOptions
-	UUID     string `json:"uuid,omitempty"`
-	Password string `json:"password,omitempty"`
+	UUID                  string `json:"uuid,omitempty"`
+	Password              string `json:"password,omitempty"`
+	PinnedCertChainSHA256 string `json:"pinned_certchain_sha256,omitempty"`
 	OutboundTLSOptionsContainer
 }

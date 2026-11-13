@@ -12,13 +12,14 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/transport/juicity"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
-	"github.com/exclavenetwork/sing-juicity"
 	"github.com/gofrs/uuid/v5"
 )
 
@@ -26,7 +27,11 @@ func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.JuicityOutboundOptions](registry, C.TypeJuicity, NewOutbound)
 }
 
-var _ adapter.Outbound = (*Outbound)(nil)
+var (
+	_ adapter.InterfaceUpdateListener = (*Outbound)(nil)
+	_ adapter.IdleConnectionKeeper    = (*Outbound)(nil)
+	_ adapter.OutboundWithMultiplex   = (*Outbound)(nil)
+)
 
 type Outbound struct {
 	outbound.Adapter
@@ -38,31 +43,30 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if options.TLS == nil || !options.TLS.Enabled {
 		return nil, C.ErrTLSRequired
 	}
-	outboundDialer, err := dialer.NewWithOptions(dialer.Options{
-		Context:        ctx,
-		Options:        options.DialerOptions,
-		RemoteIsDomain: options.ServerIsDomain(),
-	})
+	tlsConfig, err := tls.NewClient(ctx, logger, options.Server, common.PtrValueOrDefault(options.TLS))
 	if err != nil {
 		return nil, err
 	}
-	if options.TLS.ALPN == nil { // not len(options.TLS.ALPN) > 0
-		options.TLS.ALPN = []string{"h3"}
+	if options.PinnedCertChainSHA256 != "" {
+		tlsConfig, err = newPinnedCertChainConfig(tlsConfig, options.PinnedCertChainSHA256, *options.TLS)
+		if err != nil {
+			return nil, err
+		}
 	}
-	tlsConfig, err := tls.NewSTDClient(ctx, logger, options.Server, *options.TLS)
+	userUUID, err := uuid.FromString(options.UUID)
 	if err != nil {
-		return nil, err
+		return nil, E.Cause(err, "invalid uuid")
 	}
-	uuidInstance, err := uuid.FromString(options.UUID)
+	outboundDialer, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
 	if err != nil {
 		return nil, err
 	}
 	client, err := juicity.NewClient(juicity.ClientOptions{
 		Context:       ctx,
 		Dialer:        outboundDialer,
-		ServerAddress: options.Build(),
+		ServerAddress: options.ServerOptions.Build(),
 		TLSConfig:     tlsConfig,
-		UUID:          [uuid.Size]byte(uuidInstance.Bytes()),
+		UUID:          userUUID,
 		Password:      options.Password,
 	})
 	if err != nil {
@@ -75,22 +79,9 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	}, nil
 }
 
-func (h *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
-	if stage != adapter.StartStateInitialize {
-		return nil
-	}
-	scope.Add(func() error {
-		return h.client.CloseWithError(os.ErrClosed)
-	})
-	return nil
-}
-
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	switch network {
+	switch N.NetworkName(network) {
 	case N.NetworkTCP:
-		ctx, metadata := adapter.ExtendContext(ctx)
-		metadata.Outbound = h.Tag()
-		metadata.Destination = destination
 		h.logger.InfoContext(ctx, "outbound connection to ", destination)
 		return h.client.DialConn(ctx, destination)
 	case N.NetworkUDP:
@@ -105,9 +96,32 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 }
 
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	ctx, metadata := adapter.ExtendContext(ctx)
-	metadata.Outbound = h.Tag()
-	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
 	return h.client.ListenPacket(ctx, destination)
+}
+
+func (h *Outbound) InterfaceUpdated(ctx context.Context) {
+	_ = h.client.CloseWithError(E.New("network changed"))
+}
+
+func (h *Outbound) MultiplexEnabled() bool {
+	return true
+}
+
+func (h *Outbound) SetKeepIdleConnections(keep bool) {
+	h.client.SetKeepIdleConnections(keep)
+}
+
+func (h *Outbound) CloseIdleConnections() {
+	h.client.CloseIdleConnections()
+}
+
+func (h *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	if stage != adapter.StartStateInitialize {
+		return nil
+	}
+	scope.Add(func() error {
+		return h.client.CloseWithError(os.ErrClosed)
+	})
+	return nil
 }
