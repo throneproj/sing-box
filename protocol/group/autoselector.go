@@ -2,9 +2,11 @@ package group
 
 import (
 	"context"
+	"crypto/tls"
 	"io"
 	"math/rand"
 	"net"
+	"net/http"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -22,6 +24,7 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/ntp"
 	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/pause"
@@ -1037,11 +1040,58 @@ func (s *AutoSelector) probeBatch(batch []string, urgent bool) []probeResult {
 func (s *AutoSelector) probe(detour adapter.Outbound) (time.Duration, error) {
 	ctx, cancel := context.WithTimeout(s.ctx, s.probeTimeout)
 	defer cancel()
-	delay, err := urltest.URLTest(ctx, s.link, detour)
+	delay, err := warmURLTest(ctx, s.link, detour)
 	if err != nil {
 		return rttFailed, err
 	}
-	return time.Duration(delay) * time.Millisecond, nil
+	return delay, nil
+}
+
+const probeDrainLimit = 64 * 1024
+
+// warmURLTest times a second request on the connection the first one opened, so the
+// proxy handshake stays out of the sample.
+func warmURLTest(ctx context.Context, link string, detour N.Dialer) (time.Duration, error) {
+	if link == "" {
+		link = "https://www.gstatic.com/generate_204"
+	}
+	client := http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return detour.DialContext(ctx, N.NetworkTCP, M.ParseSocksaddr(addr))
+			},
+			TLSClientConfig: &tls.Config{
+				Time:    ntp.TimeFuncFromContext(ctx),
+				RootCAs: adapter.RootPoolFromContext(ctx),
+			},
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	defer client.CloseIdleConnections()
+	_, err := timeRequest(ctx, &client, link)
+	if err != nil {
+		return 0, err
+	}
+	return timeRequest(ctx, &client, link)
+}
+
+func timeRequest(ctx context.Context, client *http.Client, link string) (time.Duration, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, link, nil)
+	if err != nil {
+		return 0, err
+	}
+	start := time.Now()
+	response, err := client.Do(request)
+	if err != nil {
+		return 0, err
+	}
+	delay := time.Since(start)
+	// The transport reuses a connection only once its body was read to EOF.
+	_, _ = io.CopyN(io.Discard, response.Body, probeDrainLimit)
+	response.Body.Close()
+	return delay, nil
 }
 
 // commitRound decides whether a round's failures describe the servers or the
@@ -1398,6 +1448,7 @@ func (s *AutoSelector) evaluateLocked(now time.Time) {
 		default:
 			node.tier = tierHealthy
 		}
+		node.slow = s.maxRTT > 0 && node.tier == tierHealthy && stats.Average >= s.maxRTT
 		if s.passive {
 			node.suspect = health.passive.suspect(now)
 		}
@@ -1442,10 +1493,7 @@ func (s *AutoSelector) evaluateLocked(now time.Time) {
 }
 
 func (s *AutoSelector) qualifies(node *rankedNode) bool {
-	if node.tier != tierHealthy || node.suspect {
-		return false
-	}
-	if s.maxRTT > 0 && node.stats.Average >= s.maxRTT {
+	if node.tier != tierHealthy || node.suspect || node.slow {
 		return false
 	}
 	return node.stats.FailRatio() <= s.failTolerance
