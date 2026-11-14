@@ -102,23 +102,12 @@ func TestSortTiersDeadBelowUntested(t *testing.T) {
 	}
 }
 
-func TestSortPrefersStabilityOverRawSpeed(t *testing.T) {
-	jittery := &rankedNode{tag: "jittery", tier: tierHealthy, stats: memberStats{All: 10, Average: 90 * time.Millisecond, Deviation: 200 * time.Millisecond}}
-	steady := &rankedNode{tag: "steady", tier: tierHealthy, stats: memberStats{All: 10, Average: 150 * time.Millisecond, Deviation: 10 * time.Millisecond}}
-
-	nodes := []*rankedNode{jittery, steady}
-	sortNodes(nodes, false)
-	if nodes[0].tag != "steady" {
-		t.Fatalf("first = %q, want steady", nodes[0].tag)
-	}
-}
-
 func TestApplyBaselinesWalksUntilExpected(t *testing.T) {
 	nodes := []*rankedNode{
-		{tag: "a", stats: memberStats{Deviation: 10 * time.Millisecond}},
-		{tag: "b", stats: memberStats{Deviation: 20 * time.Millisecond}},
-		{tag: "c", stats: memberStats{Deviation: 250 * time.Millisecond}},
-		{tag: "d", stats: memberStats{Deviation: 900 * time.Millisecond}},
+		{tag: "a", stats: memberStats{Average: 10 * time.Millisecond}},
+		{tag: "b", stats: memberStats{Average: 20 * time.Millisecond}},
+		{tag: "c", stats: memberStats{Average: 250 * time.Millisecond}},
+		{tag: "d", stats: memberStats{Average: 900 * time.Millisecond}},
 	}
 	baselines := []time.Duration{50 * time.Millisecond, 300 * time.Millisecond, time.Second}
 

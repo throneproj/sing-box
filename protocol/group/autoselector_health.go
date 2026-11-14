@@ -211,8 +211,7 @@ func (h *memberHealth) stats(now time.Time) memberStats {
 	}
 	stats.Average = sum / time.Duration(count)
 	if count < 2 {
-		// Not enough data for a real deviation. Assume half the average, or a
-		// single lucky sample would always outrank a well-measured member.
+		// A lone sample has no spread; zero would report it as perfectly steady.
 		stats.Deviation = stats.Average / 2
 	} else {
 		variance := float64(0)
@@ -287,6 +286,8 @@ type rankedNode struct {
 	settled  bool
 	// Passive scoring holds the member out of the selection.
 	suspect bool
+	// Healthy, but its average is over max_rtt.
+	slow bool
 }
 
 func (n *rankedNode) state() string {
@@ -322,10 +323,9 @@ func stableByPrior(nodes []*rankedNode, prior map[string]int) {
 	})
 }
 
-// sortNodes orders by tier, then by the least-load comparators: deviation first
-// (stability beats raw speed), then average, then failures. Suspect members
-// follow the other healthy ones. byPriority puts settled healthy members first,
-// then orders every tier by priority.
+// sortNodes orders by tier, then by average, failures and deviation. Suspect
+// members, then slow ones, follow the other healthy ones. byPriority puts
+// settled healthy members first, then orders every tier by priority.
 func sortNodes(nodes []*rankedNode, byPriority bool) {
 	sort.SliceStable(nodes, func(i, j int) bool {
 		l, r := nodes[i], nodes[j]
@@ -334,6 +334,9 @@ func sortNodes(nodes []*rankedNode, byPriority bool) {
 		}
 		if l.tier == tierHealthy && l.suspect != r.suspect {
 			return r.suspect
+		}
+		if l.tier == tierHealthy && l.slow != r.slow {
+			return r.slow
 		}
 		if byPriority {
 			if l.tier == tierHealthy && l.settled != r.settled {
@@ -348,9 +351,6 @@ func sortNodes(nodes []*rankedNode, byPriority bool) {
 			// incoming order (which is the caller's ranking prior).
 			return false
 		}
-		if l.stats.Deviation != r.stats.Deviation {
-			return l.stats.Deviation < r.stats.Deviation
-		}
 		if l.stats.Average != r.stats.Average {
 			return l.stats.Average < r.stats.Average
 		}
@@ -359,6 +359,9 @@ func sortNodes(nodes []*rankedNode, byPriority bool) {
 		}
 		if l.stats.All != r.stats.All {
 			return l.stats.All > r.stats.All
+		}
+		if l.stats.Deviation != r.stats.Deviation {
+			return l.stats.Deviation < r.stats.Deviation
 		}
 		// Fully tied: the stable sort keeps the incoming order, which the caller
 		// has pre-arranged to be the previous ranking. Breaking the tie on tag
@@ -369,7 +372,7 @@ func sortNodes(nodes []*rankedNode, byPriority bool) {
 }
 
 // applyBaselines picks the qualified prefix of an already-sorted healthy slice,
-// walking each baseline until `expected` members fall inside it. With no
+// walking each baseline until `expected` members average under it. With no
 // baselines configured it degrades to a plain top-N cut.
 func applyBaselines(nodes []*rankedNode, baselines []time.Duration, expected int) []*rankedNode {
 	if len(nodes) == 0 {
@@ -387,7 +390,7 @@ func applyBaselines(nodes []*rankedNode, baselines []time.Duration, expected int
 	count := 0
 	for _, baseline := range baselines {
 		for i := count; i < len(nodes); i++ {
-			if nodes[i].stats.Deviation >= baseline {
+			if nodes[i].stats.Average >= baseline {
 				break
 			}
 			count = i + 1
