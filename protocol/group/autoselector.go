@@ -359,7 +359,8 @@ func NewAutoSelector(ctx context.Context, router adapter.Router, logger log.Cont
 	}
 	s.applyDefaults()
 
-	validity := s.interval * time.Duration(s.sampling) * 2
+	// Just past the passiveProbeStretch an active member may go unprobed, so a left network's results expire quickly.
+	validity := s.interval * (passiveProbeStretch + 1)
 	if benchValidity := s.benchInterval * 2; benchValidity > validity {
 		// Bench members are probed far less often than active ones; without this
 		// their samples would expire before the next probe and they would sink
