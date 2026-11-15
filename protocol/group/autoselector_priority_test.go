@@ -294,34 +294,31 @@ func TestPriorityIncumbentRidesOutASingleFailure(t *testing.T) {
 }
 
 func TestPriorityInterruptsOnlyOnTheWayDown(t *testing.T) {
-	for _, failbackInterrupt := range []bool{false, true} {
-		t0 := time.Now().Add(-10 * time.Minute)
-		s := prioritySelector(t, [][]string{{"primary"}, {"backup"}}, "primary", "backup")
-		s.started = true
-		s.interruptExternalConnections = true
-		s.failbackInterrupt = failbackInterrupt
-		putAt(s.members["primary"], t0, 100*time.Millisecond, 100*time.Millisecond)
-		putAt(s.members["backup"], t0, 100*time.Millisecond, 100*time.Millisecond)
-		s.evaluateLocked(t0.Add(5 * time.Second))
+	t0 := time.Now().Add(-10 * time.Minute)
+	s := prioritySelector(t, [][]string{{"primary"}, {"backup"}}, "primary", "backup")
+	s.started = true
+	s.interruptExternalConnections = true
+	putAt(s.members["primary"], t0, 100*time.Millisecond, 100*time.Millisecond)
+	putAt(s.members["backup"], t0, 100*time.Millisecond, 100*time.Millisecond)
+	s.evaluateLocked(t0.Add(5 * time.Second))
 
-		onPrimary := &closeFlag{}
-		s.interruptGroup.Add(onPrimary, true)
-		s.members["primary"].penalize(t0.Add(10*time.Second), dialBackoff, syscall.ECONNREFUSED)
-		s.evaluateLocked(t0.Add(10 * time.Second))
-		if !onPrimary.closed {
-			t.Fatal("dropping off a failed member must interrupt its connections")
-		}
+	onPrimary := &closeFlag{}
+	s.interruptGroup.Add(onPrimary, true)
+	s.members["primary"].penalize(t0.Add(10*time.Second), dialBackoff, syscall.ECONNREFUSED)
+	s.evaluateLocked(t0.Add(10 * time.Second))
+	if !onPrimary.closed {
+		t.Fatal("dropping off a failed member must interrupt its connections")
+	}
 
-		onBackup := &closeFlag{}
-		s.interruptGroup.Add(onBackup, true)
-		putAt(s.members["primary"], t0.Add(20*time.Second), 100*time.Millisecond, 100*time.Millisecond, 100*time.Millisecond)
-		s.evaluateLocked(t0.Add(2 * time.Minute))
-		if got := selectedTag(s); got != "primary" {
-			t.Fatalf("selected = %q, want primary back", got)
-		}
-		if onBackup.closed != failbackInterrupt {
-			t.Fatalf("failback_interrupt = %v closed the backup's connections = %v", failbackInterrupt, onBackup.closed)
-		}
+	onBackup := &closeFlag{}
+	s.interruptGroup.Add(onBackup, true)
+	putAt(s.members["primary"], t0.Add(20*time.Second), 100*time.Millisecond, 100*time.Millisecond, 100*time.Millisecond)
+	s.evaluateLocked(t0.Add(2 * time.Minute))
+	if got := selectedTag(s); got != "primary" {
+		t.Fatalf("selected = %q, want primary back", got)
+	}
+	if onBackup.closed {
+		t.Fatal("moving back up must leave the backup's connections alone")
 	}
 }
 

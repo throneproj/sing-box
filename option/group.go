@@ -78,16 +78,17 @@ type AutoSelectorOutboundOptions struct {
 	// Strategy "priority" uses the highest-priority healthy member instead of the
 	// best measured one, and moves back up to a recovered member only after it has
 	// passed FailbackChecks checks in a row and FailbackDelay since its last failure.
-	// Moving back up leaves live connections alone unless FailbackInterrupt is set.
+	// Moving back up leaves live connections alone.
 	Strategy string `json:"strategy,omitempty"`
 	// Tiers orders members for the priority strategy, most preferred first: a
 	// member's priority is the first tier listing it, members in no tier share one
 	// more tier after the last, and within a tier the health ranking applies.
 	// Without tiers, the order of Outbounds is the priority order.
-	Tiers             [][]string         `json:"tiers,omitempty"`
-	FailbackChecks    int                `json:"failback_checks,omitempty"`
-	FailbackDelay     badoption.Duration `json:"failback_delay,omitempty"`
-	FailbackInterrupt bool               `json:"failback_interrupt,omitempty"`
+	Tiers          [][]string         `json:"tiers,omitempty"`
+	FailbackChecks int                `json:"failback_checks,omitempty"`
+	FailbackDelay  badoption.Duration `json:"failback_delay,omitempty"`
+	// Deprecated: ignored; moving back up never interrupts.
+	FailbackInterrupt bool `json:"failback_interrupt,omitempty"`
 
 	// Balance spreads traffic over the qualified set instead of pinning the
 	// single best member. Disabled by default.
