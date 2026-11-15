@@ -66,12 +66,14 @@ type memberHealth struct {
 	idx      int
 	samples  []pingSample
 
-	dialTotal   int
-	dialFail    int
-	lastDialErr string
+	dialTotal     int
+	dialFailTotal int
+	dialFail      int
+	lastDialErr   string
 
 	lastOK    time.Time
 	lastProbe time.Time
+	networkAt time.Time
 	probes    int
 	// The most recent failed probe or dial. Unlike the cooldown it survives a
 	// success, since fail-back counts the checks passed after it.
@@ -197,16 +199,17 @@ func (h *memberHealth) stats(now time.Time) memberStats {
 		count++
 		sum += s.value
 		valid = append(valid, s.value)
-		if s.value > stats.Max {
-			stats.Max = s.value
-		}
-		if s.value < stats.Min {
-			stats.Min = s.value
+		// Samples from before a network change describe another path.
+		if s.at.After(h.networkAt) {
+			stats.Max = max(stats.Max, s.value)
+			stats.Min = min(stats.Min, s.value)
 		}
 	}
 	stats.All = count + stats.Fail
-	if count == 0 {
+	if stats.Min == rttFailed {
 		stats.Min = 0
+	}
+	if count == 0 {
 		return stats
 	}
 	stats.Average = sum / time.Duration(count)
@@ -230,6 +233,7 @@ func (h *memberHealth) inCooldown(now time.Time) bool {
 // penalize applies the next backoff step after a failed dial.
 func (h *memberHealth) penalize(now time.Time, backoff []time.Duration, err error) {
 	h.dialTotal++
+	h.dialFailTotal++
 	h.dialFail++
 	if err != nil {
 		h.lastDialErr = err.Error()
@@ -281,12 +285,14 @@ type rankedNode struct {
 	tag   string
 	tier  int
 	stats memberStats
+	// Average, or Min while in use: load only ever adds delay, so the best recent time is what the server can do.
+	latency time.Duration
 	// Set under the priority strategy only.
 	priority int
 	settled  bool
 	// Passive scoring holds the member out of the selection.
 	suspect bool
-	// Healthy, but its average is over max_rtt.
+	// Healthy, but its latency is over max_rtt.
 	slow bool
 }
 
