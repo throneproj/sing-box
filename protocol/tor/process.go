@@ -16,3 +16,8 @@ type processCreatorFunc func(ctx context.Context, args ...string) (process.Proce
 func (f processCreatorFunc) New(ctx context.Context, args ...string) (process.Process, error) {
 	return f(ctx, args...)
 }
+
+// DataDirectoryProvider, when registered in the context, replaces data_directory with a directory per bridge and exit country set, released after tor exits.
+type DataDirectoryProvider interface {
+	Acquire(key string) (path string, release func(), err error)
+}
