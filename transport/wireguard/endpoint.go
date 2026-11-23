@@ -235,7 +235,8 @@ func (e *Endpoint) Start(postStart bool) error {
 		},
 	}
 	wgDevice := device.NewDevice(e.options.Context, e.returnDevice, bind, logger, e.options.Workers)
-	if clientBind, isClientBind := bind.(*ClientBind); isClientBind {
+	clientBind, isClientBind := bind.(*ClientBind)
+	if isClientBind {
 		wgDevice.SetSessionStateFunc(e.noteSessionState)
 		clientBind.SetRedialHandler(e.handshakeOnRedial)
 	}
@@ -245,7 +246,15 @@ func (e *Endpoint) Start(postStart bool) error {
 			domainPeers[peer.publicKey] = &e.peers[peerIndex]
 		}
 	}
-	if len(domainPeers) > 0 {
+	// A connected bind dials the domain and its detour resolves it: addresses resolved here would only send each
+	// initiation once per address down that one flow, after a lookup on the sending goroutine.
+	connectedDomain := isClientBind && clientBind.isConnect && len(domainPeers) > 0
+	if connectedDomain {
+		endpoint := clientBind.connectEndpoint()
+		wgDevice.SetEndpointResolverFunc(func(device.NoisePublicKey) ([]conn.Endpoint, error) {
+			return []conn.Endpoint{endpoint}, nil
+		})
+	} else if len(domainPeers) > 0 {
 		wgDevice.SetEndpointResolverFunc(func(publicKey device.NoisePublicKey) ([]conn.Endpoint, error) {
 			peer, found := domainPeers[publicKey]
 			if !found {
@@ -286,6 +295,10 @@ func (e *Endpoint) Start(postStart bool) error {
 		if loaded {
 			wgPeers = append(wgPeers, wgPeer)
 		}
+	}
+	if connectedDomain && len(wgPeers) == 1 {
+		// wireguard-go clears only a current endpoint, so until the first reply a dead flow would never be replaced.
+		wgPeers[0].SetEndpointFromPacket(clientBind.connectEndpoint())
 	}
 	e.tunDevice.SetDevice(wgDevice, wgPeers)
 	e.device.Store(wgDevice)

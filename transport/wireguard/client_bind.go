@@ -162,7 +162,11 @@ func (c *ClientBind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint)
 	if c.hasReserved() && hasReservedField(packets[0][:n]) {
 		clear(packets[0][1:4])
 	}
-	eps[0] = remoteEndpoint{addr: M.SocksaddrFromNet(addr).Unwrap().AddrPort(), bind: c}
+	if c.isConnect {
+		eps[0] = c.connectEndpoint()
+	} else {
+		eps[0] = remoteEndpoint{addr: M.SocksaddrFromNet(addr).Unwrap().AddrPort(), bind: c}
+	}
 	count = 1
 	return
 }
@@ -254,6 +258,12 @@ func (c *ClientBind) closeUnanswered() {
 	if serverConn.Close() == nil {
 		c.logger.Debug("no reply from server, reconnecting")
 	}
+}
+
+// In connect mode the flow is the path to the peer, so every packet has this one
+// endpoint whatever address the detour reports; for a domain peer it has no address.
+func (c *ClientBind) connectEndpoint() remoteEndpoint {
+	return remoteEndpoint{addr: c.connectAddr.AddrPort(), bind: c}
 }
 
 func (c *ClientBind) ParseEndpoint(s string) (conn.Endpoint, error) {
