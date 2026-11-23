@@ -52,6 +52,7 @@ const (
 	TypeMASQUE             = "masque"
 	TypeDNSTT              = "dnstt"
 	TypeMasterDNS          = "masterdns"
+	TypePsiphon            = "psiphon"
 )
 
 const (
@@ -140,6 +141,8 @@ func ProxyDisplayName(proxyType string) string {
 		return "DNSTT"
 	case TypeMasterDNS:
 		return "MasterDNS"
+	case TypePsiphon:
+		return "Psiphon"
 	case TypeSelector:
 		return "Selector"
 	case TypeURLTest:

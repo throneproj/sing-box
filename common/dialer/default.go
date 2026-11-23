@@ -436,6 +436,11 @@ func (d *DefaultDialer) ListenPacket(ctx context.Context, destination M.Socksadd
 }
 
 func (d *DefaultDialer) ICMPControl() control.Func {
+	return d.SocketControl()
+}
+
+// SocketControl returns the controls dialed sockets get, for sockets created outside of this dialer.
+func (d *DefaultDialer) SocketControl() control.Func {
 	if d.networkStrategy == nil || d.defaultNetworkStrategy && len(d.networkType) == 0 {
 		return d.dialer4.Control
 	}

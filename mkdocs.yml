@@ -203,6 +203,7 @@ nav:
           - Snell: configuration/outbound/snell.md
           - Tailcat: configuration/outbound/tailcat.md
           - Tor: configuration/outbound/tor.md
+          - Psiphon: configuration/outbound/psiphon.md
           - SSH: configuration/outbound/ssh.md
           - DNSTT: configuration/outbound/dnstt.md
           - MasterDNS: configuration/outbound/masterdns.md
