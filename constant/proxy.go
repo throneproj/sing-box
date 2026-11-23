@@ -47,12 +47,10 @@ const (
 	TypeHysteriaRealm      = "hysteria-realm"
 	TypeACME               = "acme"
 	TypeCloudflareOriginCA = "cloudflare-origin-ca"
-	TypeJuicity            = "juicity"
 	TypeTrustTunnel        = "trusttunnel"
 	TypeMASQUE             = "masque"
 	TypeDNSTT              = "dnstt"
 	TypeMasterDNS          = "masterdns"
-	TypePsiphon            = "psiphon"
 )
 
 const (
@@ -131,8 +129,6 @@ func ProxyDisplayName(proxyType string) string {
 		return "Tailcat"
 	case TypeCloudflared:
 		return "Cloudflared"
-	case TypeJuicity:
-		return "Juicity"
 	case TypeTrustTunnel:
 		return "TrustTunnel"
 	case TypeMASQUE:
@@ -141,8 +137,6 @@ func ProxyDisplayName(proxyType string) string {
 		return "DNSTT"
 	case TypeMasterDNS:
 		return "MasterDNS"
-	case TypePsiphon:
-		return "Psiphon"
 	case TypeSelector:
 		return "Selector"
 	case TypeURLTest:

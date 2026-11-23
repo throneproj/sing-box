@@ -105,7 +105,6 @@ func OutboundRegistry() *outbound.Registry {
 	trojan.RegisterOutbound(registry)
 	registerNaiveOutbound(registry)
 	tor.RegisterOutbound(registry)
-	registerPsiphonOutbound(registry)
 	ssh.RegisterOutbound(registry)
 	dnstt.RegisterOutbound(registry)
 	masterdns.RegisterOutbound(registry)

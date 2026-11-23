@@ -35,7 +35,6 @@
 | `snell`        | [Snell](./snell/)               |
 | `tailcat`      | [Tailcat](./tailcat/)           |
 | `tor`          | [Tor](./tor/)                   |
-| `psiphon`      | [Psiphon](./psiphon/)           |
 | `ssh`          | [SSH](./ssh/)                   |
 | `dnstt`        | [DNSTT](./dnstt/)               |
 | `masterdns`    | [MasterDNS](./masterdns/)       |
