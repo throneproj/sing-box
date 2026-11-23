@@ -84,17 +84,21 @@ func newClientFactory(transport string) (base.ClientFactory, error) {
 }
 
 func newSnowflakeConfig(arguments pt.Args) (sf.ClientConfig, error) {
-	// the SQS rendezvous reaches AWS with its own HTTP client instead of the outbound dialer
-	if _, loaded := arguments.Get("sqsqueue"); loaded {
-		return sf.ClientConfig{}, E.New("unsupported rendezvous: sqsqueue")
-	}
 	var config sf.ClientConfig
 	config.BrokerURL, _ = arguments.Get("url")
-	// the snowflake client exits the process when it has no rendezvous method
-	if config.BrokerURL == "" {
+	config.AmpCacheURL, _ = arguments.Get("ampcache")
+	config.SQSQueueURL, _ = arguments.Get("sqsqueue")
+	config.SQSCredsStr, _ = arguments.Get("sqscreds")
+	if config.SQSQueueURL != "" {
+		if config.BrokerURL != "" || config.AmpCacheURL != "" {
+			return sf.ClientConfig{}, E.New("sqsqueue cannot be combined with url or ampcache")
+		}
+		if config.SQSCredsStr == "" {
+			return sf.ClientConfig{}, E.New("missing sqscreds")
+		}
+	} else if config.BrokerURL == "" {
 		return sf.ClientConfig{}, E.New("missing url")
 	}
-	config.AmpCacheURL, _ = arguments.Get("ampcache")
 	if fronts, loaded := arguments.Get("fronts"); loaded {
 		if fronts != "" {
 			config.FrontDomains = strings.Split(strings.TrimSpace(fronts), ",")

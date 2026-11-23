@@ -617,6 +617,8 @@ github.com/theodorsm/covert-dtls v1.5.1 h1:qTp59YIwGpY4eDJbR237R1MAahWLZNryDNknF
 github.com/theodorsm/covert-dtls v1.5.1/go.mod h1:MTb9IO4aqSxrcrh569UGO4PlC1Yel37M440z+gcm13E=
 github.com/throneproj/sing v0.9.4-0.20261113121621-2ce66de7d09b h1:GAgVstp+5opgbk0ADLwxREJEdqLoHyAAIRSJjYY9Du0=
 github.com/throneproj/sing v0.9.4-0.20261113121621-2ce66de7d09b/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
+github.com/throneproj/snowflake/v2 v2.15.5-0.20261123082518-be5992caba99 h1:4gzcUWfkYjfgZddApxv/E0hlo9wccwawGTZMGUxJAOw=
+github.com/throneproj/snowflake/v2 v2.15.5-0.20261123082518-be5992caba99/go.mod h1:OYTSCvNtj7WA/xsq85NlMKY+OmQBBocXTnZ43c2reL4=
 github.com/throneproj/wireguard-go v0.0.0-20261112143559-827ce83a4eed h1:kiBqon1s689TBSghRQ/SDSJgdkPxAcffMYe8JgpCn+o=
 github.com/throneproj/wireguard-go v0.0.0-20261112143559-827ce83a4eed/go.mod h1:er10sELpmzLXq7S7Pbc1Zsbyapcr+/gxNAHKTo6fzVA=
 github.com/tidwall/gjson v1.14.2/go.mod h1:/wbyibRr2FHMks5tjHJ5F8dMZh3AcwJEMf5vlfC0lxk=
@@ -681,8 +683,6 @@ gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird v0.0.0-2
 gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird v0.0.0-20261104192811-59ac7e400c38/go.mod h1:VA8Wnlj4zGoeQG06REE75Ptd5IlFPc5cH4jckqmdd4s=
 gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/ptutil v0.0.0-20250815012447-418f76dcf315 h1:9lmXguW9aH5sdZR5h5jOrdInCt0tQ9NRa7+wFD4MQBk=
 gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/ptutil v0.0.0-20250815012447-418f76dcf315/go.mod h1:PK7EvweKeypdelDyh1m7N922aldSeCAG8n0lJ7RAXWQ=
-gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/v2 v2.15.4 h1:PA8OCA1yiko1DU9EVCYdrm89sJba4ZEWBI/i8Q7M3Hg=
-gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/v2 v2.15.4/go.mod h1:OYTSCvNtj7WA/xsq85NlMKY+OmQBBocXTnZ43c2reL4=
 gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/webtunnel v0.0.7 h1:c7PutWnnXJytefsiENNo+iq2qAbE2RfUbggGtnnmuAA=
 gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/webtunnel v0.0.7/go.mod h1:GlxU1bY/uoCOkbMJpmsiynfU20eL36CGitONPa3Z2gs=
 go.opentelemetry.io/auto/sdk v1.2.1 h1:jXsnJ4Lmnqd11kwkBV2LgLoFMZKizbCi5fNZ/ipaZ64=

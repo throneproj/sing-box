@@ -296,3 +296,5 @@ require (
 replace github.com/sagernet/wireguard-go => github.com/throneproj/wireguard-go v0.0.0-20261112143559-827ce83a4eed
 
 replace github.com/sagernet/sing => github.com/throneproj/sing v0.9.4-0.20261113121621-2ce66de7d09b
+
+replace gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/v2 => github.com/throneproj/snowflake/v2 v2.15.5-0.20261123082518-be5992caba99
