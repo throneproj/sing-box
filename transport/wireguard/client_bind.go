@@ -142,7 +142,7 @@ func (c *ClientBind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint)
 		}
 		return
 	}
-	udpConn.unanswered.Store(false)
+	udpConn.unansweredSince.Store(0)
 	sizes[0] = n
 	// Only strip the reserved field when the reserved-bytes feature is in use.
 	// Leaving these bytes intact otherwise keeps AmneziaWG magic headers (which
@@ -204,16 +204,23 @@ func (c *ClientBind) Send(bufs [][]byte, ep conn.Endpoint, offset int) error {
 			return err
 		}
 	}
-	udpConn.unanswered.Store(true)
+	udpConn.unansweredSince.CompareAndSwap(0, time.Now().UnixNano())
 	return nil
 }
 
-// closeUnanswered closes the connected flow when it carried a send that got no
-// reply, so that the next send or receive dials a new one. Behind a detour the
-// flow is a single long-lived connection (UDP over a TCP proxy stream, an
-// endpoint's stack) that can stop delivering without ever returning an error,
-// e.g. after the device slept and a NAT or the server dropped it silently. A
-// listening bind shares its flow between peers and is left alone.
+// A detour can take seconds to carry a new flow's first reply (a new UDP
+// association, the proxy's dial, the server's own), longer than the 5 s between
+// handshake retries; replacing the flow at each retry would make every one pay
+// that again, so only a flow silent this long is taken for dead.
+const unansweredFlowTimeout = 15 * time.Second
+
+// closeUnanswered closes the connected flow when its sends have gone unanswered
+// for unansweredFlowTimeout, so that the next send or receive dials a new one.
+// Behind a detour the flow is a single long-lived connection (UDP over a TCP
+// proxy stream, an endpoint's stack) that can stop delivering without ever
+// returning an error, e.g. after the device slept and a NAT or the server
+// dropped it silently. A listening bind shares its flow between peers and is
+// left alone.
 func (c *ClientBind) closeUnanswered() {
 	// Held while a new flow is dialed (or the bind closes): nothing to replace then,
 	// and waiting would hold up the peer behind the dial.
@@ -222,7 +229,12 @@ func (c *ClientBind) closeUnanswered() {
 	}
 	serverConn := c.conn
 	c.connAccess.Unlock()
-	if serverConn == nil || !serverConn.unanswered.Load() {
+	if serverConn == nil {
+		return
+	}
+	// Wall clock, so that time the device slept counts as silence.
+	since := serverConn.unansweredSince.Load()
+	if since == 0 || time.Since(time.Unix(0, since)) < unansweredFlowTimeout {
 		return
 	}
 	if serverConn.Close() == nil {
@@ -271,10 +283,11 @@ func hasReservedField(b []byte) bool {
 
 type wireConn struct {
 	net.PacketConn
-	conn       net.Conn
-	access     sync.Mutex
-	done       chan struct{}
-	unanswered atomic.Bool
+	conn   net.Conn
+	access sync.Mutex
+	done   chan struct{}
+	// Unix nanoseconds of the first send since the last reply, 0 when answered.
+	unansweredSince atomic.Int64
 }
 
 func (w *wireConn) WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, error) {
