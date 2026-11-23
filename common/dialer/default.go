@@ -238,25 +238,9 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 	if options.TCPMultiPath {
 		dialer4.SetMultipathTCP(true)
 	}
-	var tlsFragment *TLSFragment = nil
-	if options.TLSFragment != nil && options.TLSFragment.Enabled {
-		tlsFragment = &TLSFragment{}
-		if options.TCPFastOpen {
-			return nil, E.New("TLS Fragmentation is not compatible with TCP Fast Open, set `tcp_fast_open` to `false` in your outbound if you intend to enable TLS fragmentation.")
-		}
-		tlsFragment.Enabled = true
-
-		sleep, err := option.Parse2IntRange(options.TLSFragment.Sleep)
-		if err != nil {
-			return nil, E.Cause(err, "invalid TLS fragment sleep period supplied")
-		}
-		tlsFragment.Sleep = sleep
-
-		size, err := option.Parse2IntRange(options.TLSFragment.Size)
-		if err != nil {
-			return nil, E.Cause(err, "invalid TLS fragment size supplied")
-		}
-		tlsFragment.Size = size
+	tlsFragment, err := NewTLSFragment(options)
+	if err != nil {
+		return nil, err
 	}
 	tcpDialer4, err := newTCPDialer(dialer4, options.TCPFastOpen, tlsFragment)
 	if err != nil {

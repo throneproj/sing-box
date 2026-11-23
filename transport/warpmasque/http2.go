@@ -34,21 +34,9 @@ type http2Conn struct {
 }
 
 func DialHTTP2(ctx context.Context, lifetime context.Context, dialer N.Dialer, destination M.Socksaddr, tlsConfig tls.Config, h2Transport *http2.Transport) (Conn, error) {
-	tlsConfig = tlsConfig.Clone()
-	tlsConfig.SetNextProtos([]string{http2.NextProtoTLS})
-	tcpConn, err := dialer.DialContext(ctx, N.NetworkTCP, destination)
+	tlsConn, err := dialTLS(ctx, dialer, destination, tlsConfig)
 	if err != nil {
 		return nil, err
-	}
-	tlsConn, err := tls.ClientHandshake(ctx, tcpConn, tlsConfig)
-	if err != nil {
-		tcpConn.Close()
-		return nil, err
-	}
-	// Cloudflare's MASQUE edge completes TLS without selecting any ALPN protocol.
-	if protocol := tlsConn.ConnectionState().NegotiatedProtocol; protocol != "" && protocol != http2.NextProtoTLS {
-		tlsConn.Close()
-		return nil, E.New("server negotiated ", protocol, " instead of HTTP/2")
 	}
 	clientConn, err := h2Transport.NewClientConn(tlsConn)
 	if err != nil {
@@ -92,6 +80,36 @@ func DialHTTP2(ctx context.Context, lifetime context.Context, dialer N.Dialer, d
 	}
 	conn.parser = http3.NewCapsuleParser(response.Body)
 	return conn, nil
+}
+
+// HandshakeHTTP2 runs only the TCP and TLS handshakes DialHTTP2 starts with, then closes.
+func HandshakeHTTP2(ctx context.Context, dialer N.Dialer, destination M.Socksaddr, tlsConfig tls.Config) error {
+	tlsConn, err := dialTLS(ctx, dialer, destination, tlsConfig)
+	if err != nil {
+		return err
+	}
+	tlsConn.Close()
+	return nil
+}
+
+func dialTLS(ctx context.Context, dialer N.Dialer, destination M.Socksaddr, tlsConfig tls.Config) (tls.Conn, error) {
+	tlsConfig = tlsConfig.Clone()
+	tlsConfig.SetNextProtos([]string{http2.NextProtoTLS})
+	tcpConn, err := dialer.DialContext(ctx, N.NetworkTCP, destination)
+	if err != nil {
+		return nil, err
+	}
+	tlsConn, err := tls.ClientHandshake(ctx, tcpConn, tlsConfig)
+	if err != nil {
+		tcpConn.Close()
+		return nil, err
+	}
+	// Cloudflare's MASQUE edge completes TLS without selecting any ALPN protocol.
+	if protocol := tlsConn.ConnectionState().NegotiatedProtocol; protocol != "" && protocol != http2.NextProtoTLS {
+		tlsConn.Close()
+		return nil, E.New("server negotiated ", protocol, " instead of HTTP/2")
+	}
+	return tlsConn, nil
 }
 
 func (c *http2Conn) ReadPacket(buffer *buf.Buffer) error {

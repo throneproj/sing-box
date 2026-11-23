@@ -24,9 +24,6 @@ const (
 	MTURejectNone MTURejectReason = iota
 	MTURejectUpload
 	MTURejectDownload
-	// MTURejectTimeout and MTURejectDecode are upload rejections where no answer arrived or none carried a tunnel packet.
-	MTURejectTimeout
-	MTURejectDecode
 )
 
 type MTUResult struct {
@@ -342,34 +339,21 @@ func (c *Client) syncedMTU() (upload int, download int) {
 
 // ProbeConnection runs the reference MTU test of one resolver and domain on a fresh socket without touching the balancer.
 func (c *Client) ProbeConnection(ctx context.Context, conn Connection, maxUploadPayload int) (MTUResult, MTURejectReason) {
-	return c.probeConnection(ctx, conn, maxUploadPayload, false)
-}
-
-// probeConnection in quick mode only checks the minimum upload and download sizes.
-func (c *Client) probeConnection(ctx context.Context, conn Connection, maxUploadPayload int, quick bool) (MTUResult, MTURejectReason) {
 	probeConn, err := c.dialResolver(ctx, conn.Resolver)
 	if err != nil {
-		return MTUResult{}, MTURejectTimeout
+		return MTUResult{}, MTURejectUpload
 	}
 	defer probeConn.Close()
 	domain := c.domains[conn.Domain]
-	outcome := probeNoAnswer
-	upload, uploadRTT := c.testUploadMTU(ctx, probeConn, domain, maxUploadPayload, quick, &outcome)
+	upload, uploadRTT := c.testUploadMTU(ctx, probeConn, domain, maxUploadPayload)
 	if upload == 0 {
-		switch outcome {
-		case probeNoAnswer:
-			return MTUResult{}, MTURejectTimeout
-		case probeUndecodable:
-			return MTUResult{}, MTURejectDecode
-		default:
-			return MTUResult{}, MTURejectUpload
-		}
+		return MTUResult{}, MTURejectUpload
 	}
 	result := MTUResult{
 		UploadMTU:      upload,
 		UploadMTUChars: wire.EncodedChars(upload, c.config.EncryptionMethod),
 	}
-	download, downloadRTT := c.testDownloadMTU(ctx, probeConn, domain, upload, quick)
+	download, downloadRTT := c.testDownloadMTU(ctx, probeConn, domain, upload)
 	if download == 0 {
 		return result, MTURejectDownload
 	}
@@ -378,7 +362,7 @@ func (c *Client) probeConnection(ctx context.Context, conn Connection, maxUpload
 	return result, MTURejectNone
 }
 
-func (c *Client) testUploadMTU(ctx context.Context, conn net.Conn, domain wire.Domain, maxPayload int, quick bool, outcome *probeOutcome) (int, time.Duration) {
+func (c *Client) testUploadMTU(ctx context.Context, conn net.Conn, domain wire.Domain, maxPayload int) (int, time.Duration) {
 	c.access.Lock()
 	limit := c.settings.MaxUploadMTU
 	c.access.Unlock()
@@ -386,16 +370,8 @@ func (c *Client) testUploadMTU(ctx context.Context, conn net.Conn, domain wire.D
 		limit = defaultUploadMaxCap
 	}
 	maxValue := min(maxPayload, limit)
-	if quick {
-		maxValue = min(maxValue, max(c.config.MTU.MinUpload, minUploadMTUFloor))
-	}
-	if maxValue < max(c.config.MTU.MinUpload, minUploadMTUFloor) {
-		*outcome = probeRejected
-		return 0, 0
-	}
 	best, rtt := BinarySearchMTU(ctx, c.config.MTU.MinUpload, maxValue, minUploadMTUFloor, c.config.MTU.TestRetries, func(size int, retry bool) (bool, time.Duration, error) {
 		result, rtt, err := c.uploadProbe(ctx, conn, domain, size, c.config.MTU.TestTimeout)
-		*outcome = max(*outcome, result)
 		return result == probePassed, rtt, err
 	})
 	if best < max(minUploadMTUFloor, c.config.MTU.MinUpload) {
@@ -404,13 +380,10 @@ func (c *Client) testUploadMTU(ctx context.Context, conn net.Conn, domain wire.D
 	return best, rtt
 }
 
-func (c *Client) testDownloadMTU(ctx context.Context, conn net.Conn, domain wire.Domain, uploadMTU int, quick bool) (int, time.Duration) {
+func (c *Client) testDownloadMTU(ctx context.Context, conn net.Conn, domain wire.Domain, uploadMTU int) (int, time.Duration) {
 	c.access.Lock()
 	maxValue := c.settings.MaxDownloadMTU
 	c.access.Unlock()
-	if quick {
-		maxValue = min(maxValue, max(c.config.MTU.MinDownload, minDownloadMTUFloor))
-	}
 	best, rtt := BinarySearchMTU(ctx, c.config.MTU.MinDownload, maxValue, minDownloadMTUFloor, c.config.MTU.TestRetries, func(size int, retry bool) (bool, time.Duration, error) {
 		result, rtt, err := c.downloadProbe(ctx, conn, domain, size, uploadMTU, c.config.MTU.TestTimeout)
 		return result == probePassed, rtt, err
