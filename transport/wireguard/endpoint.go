@@ -43,6 +43,8 @@ type Endpoint struct {
 	stateAccess    sync.Mutex
 	suspended      atomic.Bool
 	networkPaused  bool
+	// Public keys of the peers handshaking without a live session.
+	handshaking sync.Map
 }
 
 func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
@@ -233,6 +235,10 @@ func (e *Endpoint) Start(postStart bool) error {
 		},
 	}
 	wgDevice := device.NewDevice(e.options.Context, e.returnDevice, bind, logger, e.options.Workers)
+	if clientBind, isClientBind := bind.(*ClientBind); isClientBind {
+		wgDevice.SetSessionStateFunc(e.noteSessionState)
+		clientBind.SetRedialHandler(e.handshakeOnRedial)
+	}
 	domainPeers := make(map[device.NoisePublicKey]*peerConfig)
 	for peerIndex, peer := range e.peers {
 		if peer.destination.IsDomain() {
@@ -383,6 +389,33 @@ func (e *Endpoint) BindUpdate() error {
 		return nil
 	}
 	return wgDevice.BindUpdate()
+}
+
+func (e *Endpoint) noteSessionState(publicKey device.NoisePublicKey, state device.PeerSessionState) {
+	if state == device.PeerSessionHandshake {
+		e.handshaking.Store(publicKey, struct{}{})
+	} else {
+		e.handshaking.Delete(publicKey)
+	}
+}
+
+// The answer to the last initiation went down with the old flow, so a new one goes out now rather than at the next
+// retry, up to 5 s later. A handshaking peer has no live keypair, so expiring them only lifts wireguard-go's limit of
+// one initiation per retry interval.
+func (e *Endpoint) handshakeOnRedial() {
+	wgDevice := e.device.Load()
+	if wgDevice == nil {
+		return
+	}
+	e.handshaking.Range(func(key, _ any) bool {
+		peer := wgDevice.LookupPeer(key.(device.NoisePublicKey))
+		if peer != nil {
+			peer.ExpireCurrentKeypairs()
+			// A retry, so that the attempts this handshake has left are not reset.
+			peer.SendHandshakeInitiation(true)
+		}
+		return true
+	})
 }
 
 func (e *Endpoint) onPauseUpdated(event int) {

@@ -37,6 +37,14 @@ type ClientBind struct {
 	isConnect           bool
 	connectAddr         M.Socksaddr
 	reserved            [3]uint8
+	onRedial            func()
+	redialForSend       atomic.Bool
+}
+
+// SetRedialHandler sets what runs, on its own goroutine, after a flow is dialed
+// in place of one that closed with no send about to go out on the new one.
+func (c *ClientBind) SetRedialHandler(handler func()) {
+	c.onRedial = handler
 }
 
 func NewClientBind(ctx context.Context, logger logger.Logger, dialer N.Dialer, isConnect bool, connectAddr M.Socksaddr, reserved [3]uint8) *ClientBind {
@@ -79,6 +87,7 @@ func (c *ClientBind) connect() (*wireConn, error) {
 			return serverConn, nil
 		}
 	}
+	replaced := c.conn != nil
 	if c.isConnect {
 		udpConn, err := c.dialer.DialContext(c.bindCtx, N.NetworkUDP, c.connectAddr)
 		if err != nil {
@@ -97,6 +106,9 @@ func (c *ClientBind) connect() (*wireConn, error) {
 			PacketConn: bufio.NewPacketConn(udpConn),
 			done:       make(chan struct{}),
 		}
+	}
+	if replaced && !c.redialForSend.Swap(false) && c.onRedial != nil {
+		go c.onRedial()
 	}
 	return c.conn, nil
 }
@@ -237,6 +249,8 @@ func (c *ClientBind) closeUnanswered() {
 	if since == 0 || time.Since(time.Unix(0, since)) < unansweredFlowTimeout {
 		return
 	}
+	// ClearSrc runs right before a send, which goes out on the replacement.
+	c.redialForSend.Store(true)
 	if serverConn.Close() == nil {
 		c.logger.Debug("no reply from server, reconnecting")
 	}
