@@ -8,49 +8,51 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"strconv"
 	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/common/tls"
 	dnsTransport "github.com/sagernet/sing-box/dns/transport"
+	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
 
-type ProbeLevel uint8
-
 const (
-	ProbeLevelPoll ProbeLevel = iota
-	ProbeLevelQName
-	ProbeLevelHandshake
+	ProbeStagePoll  = "poll"
+	ProbeStageQName = "qname"
 )
 
 const (
-	ProbeStagePoll      = "poll"
-	ProbeStageQName     = "qname"
-	ProbeStageHandshake = "handshake"
+	ProbeReasonTimeout = "timeout"
+	ProbeReasonRcode   = "rcode"
+	ProbeReasonAnswer  = "answer"
+	ProbeReasonQName   = "qname"
 )
 
 const (
-	probeExchangeTimeout = 5 * time.Second
-	probeAttempts        = 2
+	probeExchangeTimeout = 3 * time.Second
+	probeBurstSize       = 8
+	probeBurstInterval   = 20 * time.Millisecond
+	probeShortQNameLen   = 60
 	paddingBlockLength   = 32
 	dnsttMaxQNameLen     = maxNameLength - 1
 )
 
 type ProbeResult struct {
-	Passed       bool
-	Stage        string
-	Rcode        int
-	Latency      time.Duration
-	MaxQNameLen  int
-	HandshakeRTT time.Duration
+	Passed         bool
+	Stage          string
+	Reason         string
+	Rcode          int
+	FirstReply     time.Duration
+	ShortNamesOnly bool
+	BurstSent      int
+	BurstAnswered  int
 }
 
-// Levels are cumulative; on failure Stage names the failed stage and stays empty for option errors.
-func Probe(ctx context.Context, options ClientOptions, level ProbeLevel) (ProbeResult, error) {
+// Probe returns only option errors; a failed probe sets Stage and Reason instead.
+func Probe(ctx context.Context, options ClientOptions) (ProbeResult, error) {
 	result := ProbeResult{Rcode: -1}
 	if len(options.Resolvers) != 1 {
 		return result, E.New("probe requires exactly one resolver")
@@ -68,52 +70,92 @@ func Probe(ctx context.Context, options ClientOptions, level ProbeLevel) (ProbeR
 		}
 		resolver = resolvers[0]
 	}
-	prober := newProber(client, resolver)
-	defer prober.close()
 	clientID := make([]byte, client.wire.clientIDSize)
 	_, err = rand.Read(clientID)
 	if err != nil {
 		return result, err
 	}
-	err = prober.probePoll(ctx, clientID, &result)
+	prober := newProber(client, resolver, clientID)
+	defer prober.close()
+	polls, err := prober.polls(2)
 	if err != nil {
-		result.Stage = ProbeStagePoll
 		return result, err
 	}
-	if level >= ProbeLevelQName {
-		err = prober.probeQName(ctx, clientID, &result)
-		if err != nil {
-			result.Stage = ProbeStageQName
-			return result, err
-		}
+	// The server holds a lone query for up to a second and releases it when the next one arrives, so queries go in pairs.
+	replies := prober.exchangeAll(ctx, polls, 0, func(_ int, reply probeReply) bool {
+		return reply.reason == ""
+	})
+	first := firstReply(replies)
+	result.FirstReply = first.rtt
+	if !common.Any(replies, func(it probeReply) bool { return it.reason == "" }) {
+		result.Stage = ProbeStagePoll
+		result.Reason = first.reason
+		result.Rcode = first.rcode
+		return result, nil
 	}
-	if level >= ProbeLevelHandshake {
-		client.resolvers = []ResolverOptions{resolver}
-		start := time.Now()
-		var s *session
-		s, err = client.newSession(ctx)
-		if err != nil {
-			result.Stage = ProbeStageHandshake
-			return result, err
-		}
-		result.HandshakeRTT = time.Since(start)
-		s.close()
+	result.Rcode = rcodeNoError
+	qNameLen := dnsttMaxQNameLen
+	if client.wire.vaydns {
+		qNameLen = client.wire.maxQNameLen
 	}
+	reply, err := prober.checkQName(ctx, qNameLen)
+	if err != nil {
+		return result, err
+	}
+	if reply.reason != "" {
+		result.Stage = ProbeStageQName
+		result.Reason = ProbeReasonQName
+		result.Rcode = reply.rcode
+		if qNameLen > probeShortQNameLen && probePayloadLength(client.wire, probeShortQNameLen) > len(clientID) {
+			reply, err = prober.checkQName(ctx, probeShortQNameLen)
+			if err != nil {
+				return result, err
+			}
+			result.ShortNamesOnly = reply.reason == ""
+		}
+		return result, nil
+	}
+	polls, err = prober.polls(probeBurstSize)
+	if err != nil {
+		return result, err
+	}
+	replies = prober.exchangeAll(ctx, polls, probeBurstInterval, nil)
+	result.BurstSent = len(replies)
+	result.BurstAnswered = len(common.Filter(replies, func(it probeReply) bool { return it.reason == "" }))
 	result.Passed = true
 	return result, nil
+}
+
+// probeReply has a zero rtt when nothing came back and an empty reason for a valid empty answer.
+type probeReply struct {
+	rtt    time.Duration
+	rcode  int
+	reason string
+}
+
+func firstReply(replies []probeReply) probeReply {
+	first := probeReply{rcode: -1, reason: ProbeReasonTimeout}
+	for _, reply := range replies {
+		if reply.rtt > 0 && (first.rtt == 0 || reply.rtt < first.rtt) {
+			first = reply
+		}
+	}
+	return first
 }
 
 type prober struct {
 	client     *Client
 	resolver   ResolverOptions
+	clientID   []byte
 	httpClient *http.Client
 	transport  *dnsTransport.HTTPSTransportWrapper
 }
 
-func newProber(client *Client, resolver ResolverOptions) *prober {
+func newProber(client *Client, resolver ResolverOptions, clientID []byte) *prober {
 	p := &prober{
 		client:   client,
 		resolver: resolver,
+		clientID: clientID,
 	}
 	if resolver.Type == ResolverTypeHTTPS {
 		p.transport = dnsTransport.NewHTTPSTransportWrapper(tls.NewDialer(client.transportConfig.dialer, resolver.TLSConfig), resolver.Server, new(atomic.Bool))
@@ -128,123 +170,82 @@ func (p *prober) close() {
 	}
 }
 
-func (p *prober) probePoll(ctx context.Context, clientID []byte, result *ProbeResult) error {
-	var response *dnsMessage
-	for attempt := 1; ; attempt++ {
-		query, err := p.client.wire.encodeQuery(clientID, nil, rand.Reader)
+func (p *prober) polls(count int) ([][]byte, error) {
+	queries := make([][]byte, count)
+	for i := range queries {
+		query, err := p.client.wire.encodeQuery(p.clientID, nil, rand.Reader)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		response, result.Latency, err = p.exchange(ctx, query)
-		if err == nil {
-			break
-		}
-		if attempt == probeAttempts || ctx.Err() != nil {
-			return err
-		}
+		queries[i] = query
 	}
-	result.Rcode = response.rcode()
-	return p.checkEmptyAnswer(response)
+	return queries, nil
 }
 
-func (p *prober) checkEmptyAnswer(response *dnsMessage) error {
-	if response.rcode() != rcodeNoError {
-		return E.New("resolver answered with RCODE ", response.rcode())
+// checkQName sends a name of the given length with a poll behind it that releases it from the server's hold.
+func (p *prober) checkQName(ctx context.Context, maxQNameLen int) (probeReply, error) {
+	query, err := probeQNameQuery(p.client.wire, p.clientID, maxQNameLen)
+	if err != nil {
+		return probeReply{}, err
 	}
-	if len(response.Answer) != 1 {
-		return E.New("expected one answer record, got ", len(response.Answer))
+	polls, err := p.polls(1)
+	if err != nil {
+		return probeReply{}, err
 	}
-	if response.Answer[0].Type != p.client.wire.queryType() {
-		return E.New("expected answer type ", p.client.wire.queryType(), ", got ", response.Answer[0].Type)
+	replies := p.exchangeAll(ctx, [][]byte{query, polls[0]}, 0, func(index int, _ probeReply) bool {
+		return index == 0
+	})
+	return replies[0], nil
+}
+
+// exchangeAll sends the queries interval apart, each over its own connection, and returns the replies to those sent;
+// settled ends the wait once the replies so far decide the result.
+func (p *prober) exchangeAll(ctx context.Context, queries [][]byte, interval time.Duration, settled func(index int, reply probeReply) bool) []probeReply {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type indexedReply struct {
+		index int
+		reply probeReply
+	}
+	replyChan := make(chan indexedReply, len(queries))
+	var sent int
+	for index, query := range queries {
+		if index > 0 && interval > 0 {
+			timer := time.NewTimer(interval)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+			case <-timer.C:
+			}
+			if ctx.Err() != nil {
+				break
+			}
+		}
+		go func() {
+			replyChan <- indexedReply{index, p.exchange(ctx, query)}
+		}()
+		sent++
+	}
+	replies := make([]probeReply, sent)
+	for range sent {
+		received := <-replyChan
+		replies[received.index] = received.reply
+		if settled != nil && settled(received.index, received.reply) {
+			cancel()
+		}
+	}
+	return replies
+}
+
+func (p *prober) isEmptyAnswer(response *dnsMessage) bool {
+	if len(response.Answer) != 1 || response.Answer[0].Type != p.client.wire.queryType() {
+		return false
 	}
 	payload, loaded := p.client.wire.responsePayload(response)
-	if !loaded {
-		return E.New("undecodable answer")
-	}
-	if len(payload) != 0 {
-		return E.New("unexpected downstream data for a new client")
-	}
-	return nil
+	return loaded && len(payload) == 0
 }
 
 // The filler parses as padding or as a truncated packet, so the server queues nothing.
-func (p *prober) probeQName(ctx context.Context, clientID []byte, result *ProbeResult) error {
-	wire := p.client.wire
-	upper := dnsttMaxQNameLen
-	required := dnsttMaxQNameLen
-	if wire.vaydns {
-		upper = vaydnsMaxQNameLen
-		required = wire.maxQNameLen
-	}
-	lower := wire.domain.wireLength() + 1
-	for lower <= upper && probePayloadLength(wire, lower) <= len(clientID) {
-		lower++
-	}
-	if lower > upper {
-		return E.New("domain ", wire.domain, " leaves no room for payload")
-	}
-	passed := func(maxQNameLen int) (bool, error) {
-		var lastErr error
-		for range probeAttempts {
-			query, err := probeQNameQuery(wire, clientID, maxQNameLen)
-			if err != nil {
-				return false, err
-			}
-			response, _, err := p.exchange(ctx, query)
-			if ctx.Err() != nil {
-				return false, ctx.Err()
-			}
-			if err == nil {
-				err = p.checkEmptyAnswer(response)
-				if err == nil {
-					return true, nil
-				}
-			}
-			lastErr = err
-		}
-		p.client.logger.Debug("probe max_qname_len ", maxQNameLen, ": ", lastErr)
-		return false, nil
-	}
-	ok, err := passed(upper)
-	if err != nil {
-		return err
-	}
-	if ok {
-		result.MaxQNameLen = upper
-		return nil
-	}
-	ok, err = passed(lower)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return E.New("resolver does not forward queries with max_qname_len ", lower)
-	}
-	low, high := lower, upper
-	for high-low > 1 {
-		middle := low + (high-low)/2
-		ok, err = passed(middle)
-		if err != nil {
-			return err
-		}
-		if ok {
-			low = middle
-		} else {
-			high = middle
-		}
-	}
-	result.MaxQNameLen = low
-	if low < required {
-		return E.New("resolver forwards queries up to max_qname_len ", low, ", ", required, " required")
-	}
-	return nil
-}
-
-func probePayloadLength(wire *wireFormat, maxQNameLen int) int {
-	available := maxQNameLen - wire.domain.wireLength()
-	return available * encodedLabelLength / encodedLabelWireLength * base32BlockDecodeLength / base32BlockLength
-}
-
 func probeQNameQuery(wire *wireFormat, clientID []byte, maxQNameLen int) ([]byte, error) {
 	payload := make([]byte, probePayloadLength(wire, maxQNameLen))
 	_, err := rand.Read(payload)
@@ -279,35 +280,43 @@ func probeQNameQuery(wire *wireFormat, clientID []byte, maxQNameLen int) ([]byte
 	return appendQuery(nil, binary.BigEndian.Uint16(id[:]), name, wire.queryType()), nil
 }
 
-func (p *prober) exchange(ctx context.Context, query []byte) (*dnsMessage, time.Duration, error) {
-	exchangeCtx, cancel := context.WithTimeout(ctx, probeExchangeTimeout)
+func probePayloadLength(wire *wireFormat, maxQNameLen int) int {
+	available := maxQNameLen - wire.domain.wireLength()
+	return available * encodedLabelLength / encodedLabelWireLength * base32BlockDecodeLength / base32BlockLength
+}
+
+func (p *prober) exchange(ctx context.Context, query []byte) probeReply {
+	ctx, cancel := context.WithTimeout(ctx, probeExchangeTimeout)
 	defer cancel()
 	var (
 		response []byte
-		latency  time.Duration
+		rtt      time.Duration
 		err      error
 	)
 	switch p.resolver.Type {
 	case ResolverTypeTCP, ResolverTypeTLS:
-		response, latency, err = p.exchangeStream(exchangeCtx, query)
+		response, rtt, err = p.exchangeStream(ctx, query)
 	case ResolverTypeHTTPS:
-		response, latency, err = p.exchangeHTTPS(exchangeCtx, query)
+		response, rtt, err = p.exchangeHTTPS(ctx, query)
 	default:
-		response, latency, err = p.exchangeUDP(exchangeCtx, query)
+		response, rtt, err = p.exchangeUDP(ctx, query)
 	}
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, 0, ctx.Err()
-		} else if exchangeCtx.Err() != nil {
-			return nil, 0, E.New("no response within ", probeExchangeTimeout)
-		}
-		return nil, 0, err
+		return probeReply{rcode: -1, reason: ProbeReasonTimeout}
 	}
+	// A reply faster than the clock resolution must not read as none.
+	reply := probeReply{rtt: max(rtt, time.Nanosecond), rcode: -1, reason: ProbeReasonAnswer}
 	message, err := parseMessage(response)
 	if err != nil {
-		return nil, 0, E.Cause(err, "parse response")
+		return reply
 	}
-	return message, latency, nil
+	reply.rcode = message.rcode()
+	if reply.rcode != rcodeNoError {
+		reply.reason = ProbeReasonRcode
+	} else if p.isEmptyAnswer(message) {
+		reply.reason = ""
+	}
+	return reply
 }
 
 func isResponseTo(response []byte, query []byte) bool {
@@ -340,11 +349,14 @@ func (p *prober) exchangeUDP(ctx context.Context, query []byte) ([]byte, time.Du
 		if M.SocksaddrFromNet(addr).Unwrap() != server || !isResponseTo(buffer[:n], query) {
 			continue
 		}
+		rtt := time.Since(start)
 		if isTruncated(buffer[:n]) && p.resolver.TCPFallback {
 			response, err := exchangeTCP(ctx, config, p.resolver.Server, query)
-			return response, time.Since(start), err
+			if err == nil {
+				return response, rtt, nil
+			}
 		}
-		return buffer[:n], time.Since(start), nil
+		return buffer[:n], rtt, nil
 	}
 }
 
@@ -396,12 +408,9 @@ func (p *prober) exchangeHTTPS(ctx context.Context, query []byte) ([]byte, time.
 		return nil, 0, err
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return nil, 0, E.New("unexpected HTTP status ", response.Status)
-	}
-	contentType := response.Header.Get("Content-Type")
-	if contentType != dnsMessageMimeType {
-		return nil, 0, E.New("unknown HTTP response Content-Type ", strconv.Quote(contentType))
+	if response.StatusCode != http.StatusOK || response.Header.Get("Content-Type") != dnsMessageMimeType {
+		// Not a DNS message, but still the resolver's reply.
+		return nil, time.Since(start), nil
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, httpMaxResponseSize))
 	if err != nil {

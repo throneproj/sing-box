@@ -38,19 +38,8 @@ type http3Conn struct {
 // descriptor itself (GSO, ECN, batched reads, DF), which a connected one only allows through quic.DialConn,
 // and that cannot set the connection ID length.
 func DialHTTP3(ctx context.Context, packetConn net.PacketConn, destination M.Socksaddr, tlsConfig *tls.Config, quicConfig *quic.Config) (Conn, error) {
-	transport := &quic.Transport{
-		Conn: packetConn,
-		// Cloudflare closes connections with PROTOCOL_VIOLATION now and then on the default length.
-		ConnectionIDLength: 20,
-	}
-	// The connection owns the transport and the UDP socket, so its death releases both.
-	transport.SetSingleUse(true)
-	transport.SetCreatedConn(true)
-	tlsConfig = tlsConfig.Clone()
-	tlsConfig.NextProtos = []string{http3.NextProtoH3}
-	quicConn, err := transport.DialEarly(ctx, destination.UDPAddr(), tlsConfig, quicConfig)
+	transport, quicConn, err := dialQUIC(ctx, packetConn, destination, tlsConfig, quicConfig)
 	if err != nil {
-		transport.Close()
 		return nil, err
 	}
 	stream, err := openHTTP3Stream(ctx, quicConn)
@@ -70,6 +59,36 @@ func DialHTTP3(ctx context.Context, packetConn net.PacketConn, destination M.Soc
 	}
 	go conn.drainCapsules()
 	return conn, nil
+}
+
+// HandshakeHTTP3 runs only the QUIC handshake DialHTTP3 starts with, then closes; it takes ownership of packetConn.
+func HandshakeHTTP3(ctx context.Context, packetConn net.PacketConn, destination M.Socksaddr, tlsConfig *tls.Config, quicConfig *quic.Config) error {
+	transport, quicConn, err := dialQUIC(ctx, packetConn, destination, tlsConfig, quicConfig)
+	if err != nil {
+		return err
+	}
+	quicConn.CloseWithError(0, "")
+	transport.Close()
+	return nil
+}
+
+func dialQUIC(ctx context.Context, packetConn net.PacketConn, destination M.Socksaddr, tlsConfig *tls.Config, quicConfig *quic.Config) (*quic.Transport, *quic.Conn, error) {
+	transport := &quic.Transport{
+		Conn: packetConn,
+		// Cloudflare closes connections with PROTOCOL_VIOLATION now and then on the default length.
+		ConnectionIDLength: 20,
+	}
+	// The connection owns the transport and the UDP socket, so its death releases both.
+	transport.SetSingleUse(true)
+	transport.SetCreatedConn(true)
+	tlsConfig = tlsConfig.Clone()
+	tlsConfig.NextProtos = []string{http3.NextProtoH3}
+	quicConn, err := transport.DialEarly(ctx, destination.UDPAddr(), tlsConfig, quicConfig)
+	if err != nil {
+		transport.Close()
+		return nil, nil, err
+	}
+	return transport, quicConn, nil
 }
 
 func openHTTP3Stream(ctx context.Context, quicConn *quic.Conn) (*http3.RequestStream, error) {

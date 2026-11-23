@@ -24,11 +24,11 @@ func (d *DefaultDialer) QUICOpener() func() []byte {
 	if !d.quicOpener {
 		return nil
 	}
-	return newQUICOpener
+	return NewQUICOpener
 }
 
 // DPI that keys a UDP flow on its first packet's QUIC version lets the flow through after a v2 decoy.
-func newQUICOpener() []byte {
+func NewQUICOpener() []byte {
 	packet := make([]byte, quicOpenerLength)
 	rand.Read(packet)
 	packet[0] = 0xc0 | 0x10 | packet[0]&0x0f
@@ -45,12 +45,12 @@ func newQUICOpener() []byte {
 }
 
 func writeQUICOpener(conn net.Conn) {
-	_, _ = conn.Write(newQUICOpener())
+	_, _ = conn.Write(NewQUICOpener())
 }
 
 func writeQUICOpenerTo(conn net.PacketConn, destination M.Socksaddr) {
 	if !destination.IsIP() || destination.Addr.IsUnspecified() || destination.Port == 0 {
 		return
 	}
-	_, _ = conn.WriteTo(newQUICOpener(), destination.UDPAddr())
+	_, _ = conn.WriteTo(NewQUICOpener(), destination.UDPAddr())
 }

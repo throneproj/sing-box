@@ -127,16 +127,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		ResolvePeer: func(domain string) ([]netip.Addr, error) {
 			return ep.dnsRouter.Lookup(ctx, domain, outboundDialer.(dialer.ResolveDialer).QueryOptions())
 		},
-		Peers: common.Map(options.Peers, func(it option.WireGuardPeer) wireguard.PeerOptions {
-			return wireguard.PeerOptions{
-				Endpoint:                    M.ParseSocksaddrHostPort(it.Address, it.Port),
-				PublicKey:                   it.PublicKey,
-				PreSharedKey:                it.PreSharedKey,
-				AllowedIPs:                  it.AllowedIPs,
-				PersistentKeepaliveInterval: string(it.PersistentKeepaliveInterval),
-				Reserved:                    it.Reserved,
-			}
-		}),
+		Peers:     common.Map(options.Peers, mapPeerOptions),
 		Workers:   options.Workers,
 		AmneziaWG: mapAmneziaWGOptions(options.AmneziaWG),
 	})
@@ -145,6 +136,17 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 	}
 	ep.endpoint = wgEndpoint
 	return ep, nil
+}
+
+func mapPeerOptions(it option.WireGuardPeer) wireguard.PeerOptions {
+	return wireguard.PeerOptions{
+		Endpoint:                    M.ParseSocksaddrHostPort(it.Address, it.Port),
+		PublicKey:                   it.PublicKey,
+		PreSharedKey:                it.PreSharedKey,
+		AllowedIPs:                  it.AllowedIPs,
+		PersistentKeepaliveInterval: string(it.PersistentKeepaliveInterval),
+		Reserved:                    it.Reserved,
+	}
 }
 
 func mapAmneziaWGOptions(o *option.AmneziaWGOptions) *wireguard.AmneziaWGOptions {

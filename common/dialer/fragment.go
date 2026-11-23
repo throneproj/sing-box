@@ -13,6 +13,7 @@ import (
 	opts "github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/bufio"
+	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -20,6 +21,29 @@ type TLSFragment struct {
 	Enabled bool
 	Sleep   opts.IntRange
 	Size    opts.IntRange
+}
+
+// NewTLSFragment parses the dialer's `tls_fragment`; it returns nil when fragmentation is off.
+func NewTLSFragment(options opts.DialerOptions) (*TLSFragment, error) {
+	if options.TLSFragment == nil || !options.TLSFragment.Enabled {
+		return nil, nil
+	}
+	if options.TCPFastOpen {
+		return nil, E.New("TLS Fragmentation is not compatible with TCP Fast Open, set `tcp_fast_open` to `false` in your outbound if you intend to enable TLS fragmentation.")
+	}
+	sleep, err := opts.Parse2IntRange(options.TLSFragment.Sleep)
+	if err != nil {
+		return nil, E.Cause(err, "invalid TLS fragment sleep period supplied")
+	}
+	size, err := opts.Parse2IntRange(options.TLSFragment.Size)
+	if err != nil {
+		return nil, E.Cause(err, "invalid TLS fragment size supplied")
+	}
+	return &TLSFragment{
+		Enabled: true,
+		Sleep:   sleep,
+		Size:    size,
+	}, nil
 }
 
 type fragmentConn struct {
