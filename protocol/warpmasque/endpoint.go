@@ -105,39 +105,13 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 	default:
 		return nil, E.New("unknown HTTP version: ", options.HTTPVersion)
 	}
-	if options.TLS == nil || !options.TLS.Enabled {
-		return nil, C.ErrTLSRequired
-	}
-	tlsOptions := *options.TLS
-	if tlsOptions.Reality != nil && tlsOptions.Reality.Enabled {
-		return nil, E.New("reality is not supported")
-	}
-	if len(tlsOptions.ClientCertificate) > 0 || tlsOptions.ClientCertificatePath != "" || len(tlsOptions.ClientKey) > 0 || tlsOptions.ClientKeyPath != "" {
-		return nil, E.New("`tls.client_certificate` and `tls.client_key` are derived from `private_key`")
-	}
-	if options.PeerPublicKey != "" {
-		if len(tlsOptions.CertificatePublicKeySHA256) > 0 {
-			return nil, E.New("`peer_public_key` is conflict with `tls.certificate_public_key_sha256`")
-		}
-		if len(tlsOptions.Certificate) > 0 || tlsOptions.CertificatePath != "" {
-			return nil, E.New("`peer_public_key` is conflict with `tls.certificate` and `tls.certificate_path`")
-		}
-		publicKeySHA256, err := peerPublicKeySHA256(options.PeerPublicKey)
-		if err != nil {
-			return nil, err
-		}
-		tlsOptions.CertificatePublicKeySHA256 = badoption.Listable[[]byte]{publicKeySHA256}
-	}
-	if options.PrivateKey == "" {
-		return nil, E.New("missing `private_key`")
-	}
-	privateKey, err := parsePrivateKey(options.PrivateKey)
+	tlsOptions, err := newTLSOptions(options)
 	if err != nil {
 		return nil, err
 	}
-	privateKeyPEM, err := encodePrivateKey(privateKey)
+	privateKey, privateKeyPEM, err := loadPrivateKey(options.PrivateKey)
 	if err != nil {
-		return nil, E.Cause(err, "encode private_key")
+		return nil, err
 	}
 	timeFunc := ntp.TimeFuncFromContext(ctx)
 	if timeFunc == nil {
@@ -159,37 +133,10 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 			return nil, err
 		}
 	}
-	mtu := options.MTU
-	if mtu == 0 {
-		mtu = defaultMTU
-	}
-	keepAlivePeriod := time.Duration(options.KeepAlivePeriod)
-	if keepAlivePeriod == 0 {
-		keepAlivePeriod = defaultKeepAlivePeriod
-	}
-	quicConfig := &quic.Config{
-		HandshakeIdleTimeout:           stdConfig.HandshakeTimeout(),
-		MaxIdleTimeout:                 time.Duration(options.IdleTimeout),
-		InitialStreamReceiveWindow:     options.StreamReceiveWindow.Value(),
-		MaxStreamReceiveWindow:         options.StreamReceiveWindow.Value(),
-		InitialConnectionReceiveWindow: options.ConnectionReceiveWindow.Value(),
-		MaxConnectionReceiveWindow:     options.ConnectionReceiveWindow.Value(),
-		KeepAlivePeriod:                keepAlivePeriod,
-		InitialPacketSize:              defaultInitialPacketSize,
-		DisablePathMTUDiscovery:        options.DisablePathMTUDiscovery,
-		EnableDatagrams:                true,
-	}
-	if options.InitialPacketSize > 0 {
-		quicConfig.InitialPacketSize = uint16(options.InitialPacketSize)
-	} else if options.DisablePathMTUDiscovery {
-		// Without PMTUD the packet size never grows, so it must fit a full-MTU packet from the start.
-		quicConfig.InitialPacketSize = uint16(min(mtu+datagramOverhead, math.MaxUint16))
-	}
-	if options.MaxConcurrentStreams > 0 {
-		quicConfig.MaxIncomingStreams = int64(options.MaxConcurrentStreams)
-	}
+	mtu := endpointMTU(options)
+	quicConfig := newQUICConfig(options, stdConfig.HandshakeTimeout())
 	http2Options := options.HTTP2Options
-	http2Options.KeepAlivePeriod = badoption.Duration(keepAlivePeriod)
+	http2Options.KeepAlivePeriod = badoption.Duration(quicConfig.KeepAlivePeriod)
 	h2Transport, err := httpclient.ConfigureHTTP2Transport(http2Options)
 	if err != nil {
 		return nil, err
@@ -258,6 +205,85 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		},
 	}
 	return ep, nil
+}
+
+// newTLSOptions requires TLS and turns peer_public_key into a server key pin; the client certificate is added per dial.
+func newTLSOptions(options option.WARPMASQUEEndpointOptions) (option.OutboundTLSOptions, error) {
+	if options.TLS == nil || !options.TLS.Enabled {
+		return option.OutboundTLSOptions{}, C.ErrTLSRequired
+	}
+	tlsOptions := *options.TLS
+	if tlsOptions.Reality != nil && tlsOptions.Reality.Enabled {
+		return option.OutboundTLSOptions{}, E.New("reality is not supported")
+	}
+	if len(tlsOptions.ClientCertificate) > 0 || tlsOptions.ClientCertificatePath != "" || len(tlsOptions.ClientKey) > 0 || tlsOptions.ClientKeyPath != "" {
+		return option.OutboundTLSOptions{}, E.New("`tls.client_certificate` and `tls.client_key` are derived from `private_key`")
+	}
+	if options.PeerPublicKey != "" {
+		if len(tlsOptions.CertificatePublicKeySHA256) > 0 {
+			return option.OutboundTLSOptions{}, E.New("`peer_public_key` is conflict with `tls.certificate_public_key_sha256`")
+		}
+		if len(tlsOptions.Certificate) > 0 || tlsOptions.CertificatePath != "" {
+			return option.OutboundTLSOptions{}, E.New("`peer_public_key` is conflict with `tls.certificate` and `tls.certificate_path`")
+		}
+		publicKeySHA256, err := peerPublicKeySHA256(options.PeerPublicKey)
+		if err != nil {
+			return option.OutboundTLSOptions{}, err
+		}
+		tlsOptions.CertificatePublicKeySHA256 = badoption.Listable[[]byte]{publicKeySHA256}
+	}
+	return tlsOptions, nil
+}
+
+func loadPrivateKey(content string) (*ecdsa.PrivateKey, string, error) {
+	if content == "" {
+		return nil, "", E.New("missing `private_key`")
+	}
+	privateKey, err := parsePrivateKey(content)
+	if err != nil {
+		return nil, "", err
+	}
+	privateKeyPEM, err := encodePrivateKey(privateKey)
+	if err != nil {
+		return nil, "", E.Cause(err, "encode private_key")
+	}
+	return privateKey, privateKeyPEM, nil
+}
+
+func endpointMTU(options option.WARPMASQUEEndpointOptions) uint32 {
+	if options.MTU == 0 {
+		return defaultMTU
+	}
+	return options.MTU
+}
+
+func newQUICConfig(options option.WARPMASQUEEndpointOptions, handshakeTimeout time.Duration) *quic.Config {
+	keepAlivePeriod := time.Duration(options.KeepAlivePeriod)
+	if keepAlivePeriod == 0 {
+		keepAlivePeriod = defaultKeepAlivePeriod
+	}
+	quicConfig := &quic.Config{
+		HandshakeIdleTimeout:           handshakeTimeout,
+		MaxIdleTimeout:                 time.Duration(options.IdleTimeout),
+		InitialStreamReceiveWindow:     options.StreamReceiveWindow.Value(),
+		MaxStreamReceiveWindow:         options.StreamReceiveWindow.Value(),
+		InitialConnectionReceiveWindow: options.ConnectionReceiveWindow.Value(),
+		MaxConnectionReceiveWindow:     options.ConnectionReceiveWindow.Value(),
+		KeepAlivePeriod:                keepAlivePeriod,
+		InitialPacketSize:              defaultInitialPacketSize,
+		DisablePathMTUDiscovery:        options.DisablePathMTUDiscovery,
+		EnableDatagrams:                true,
+	}
+	if options.InitialPacketSize > 0 {
+		quicConfig.InitialPacketSize = uint16(options.InitialPacketSize)
+	} else if options.DisablePathMTUDiscovery {
+		// Without PMTUD the packet size never grows, so it must fit a full-MTU packet from the start.
+		quicConfig.InitialPacketSize = uint16(min(endpointMTU(options)+datagramOverhead, math.MaxUint16))
+	}
+	if options.MaxConcurrentStreams > 0 {
+		quicConfig.MaxIncomingStreams = int64(options.MaxConcurrentStreams)
+	}
+	return quicConfig
 }
 
 func (e *Endpoint) Start(stage adapter.StartStage, scope *adapter.Scope) error {
