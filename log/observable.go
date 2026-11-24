@@ -160,13 +160,25 @@ func (f *defaultFactory) output(ctx context.Context, level Level, tag string, me
 	if f.needObservable {
 		f.subscriber.Emit(Entry{level, f.formatter.FormatSimple(ctx, tag, message)})
 	}
-	platformWriters := f.loadPlatformWriters()
-	if len(platformWriters) > 0 {
-		platformMessage := f.platformFormatter.Format(ctx, level, tag, message, timestamp)
-		for _, platformWriter := range platformWriters {
-			platformWriter.WriteMessage(level, platformMessage)
+	var platformMessage string
+	for _, platformWriter := range f.loadPlatformWriters() {
+		if !platformWriterWants(platformWriter, level) {
+			continue
+		}
+		if platformMessage == "" {
+			platformMessage = f.platformFormatter.Format(ctx, level, tag, message, timestamp)
+		}
+		platformWriter.WriteMessage(level, platformMessage)
+	}
+}
+
+func (f *defaultFactory) platformWanted(level Level) bool {
+	for _, platformWriter := range f.loadPlatformWriters() {
+		if platformWriterWants(platformWriter, level) {
+			return true
 		}
 	}
+	return false
 }
 
 var _ ContextLogger = (*observableLogger)(nil)
@@ -178,8 +190,7 @@ type observableLogger struct {
 
 func (l *observableLogger) Log(ctx context.Context, level Level, args []any) {
 	level = OverrideLevelFromContext(level, ctx)
-	platformWriters := l.loadPlatformWriters()
-	if level > l.level && len(platformWriters) == 0 && !l.needObservable {
+	if level > l.level && !l.needObservable && !l.platformWanted(level) {
 		return
 	}
 	nowTime := time.Now()
