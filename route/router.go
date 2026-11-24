@@ -39,8 +39,10 @@ type Router struct {
 	network                      adapter.NetworkManager
 	httpClientManager            adapter.HTTPClientManager
 	rules                        []adapter.Rule
+	dnsRules                     []option.DNSRule
 	needFindProcess              bool
 	ruleSetNeedFindProcess       atomic.Bool
+	dnsFindProcess               atomic.Bool
 	ruleSetNeedFindProcessAccess sync.Mutex
 	hasUpdatableRuleSet          bool
 	needFindNeighbor             bool
@@ -69,8 +71,9 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.Route
 		network:           service.FromContext[adapter.NetworkManager](ctx),
 		httpClientManager: service.FromContext[adapter.HTTPClientManager](ctx),
 		rules:             make([]adapter.Rule, 0, len(options.Rules)),
+		dnsRules:          dnsOptions.Rules,
 		ruleSetMap:        make(map[string]adapter.RuleSet),
-		needFindProcess:   hasRule(options.Rules, isProcessRule) || hasDNSRule(dnsOptions.Rules, isProcessDNSRule) || options.FindProcess || C.IsAndroid && platformInterface != nil,
+		needFindProcess:   hasRule(options.Rules, isProcessRule) || hasDNSRule(dnsOptions.Rules, isProcessDNSRule) || options.FindProcess,
 		needFindNeighbor:  hasRule(options.Rules, isNeighborRule) || hasDNSRule(dnsOptions.Rules, isNeighborDNSRule) || hasLocalNeighborDNSServer(dnsOptions.Servers) || options.FindNeighbor,
 		leaseFiles:        options.DHCPLeaseFiles,
 		pauseManager:      service.FromContext[pause.Manager](ctx),
@@ -297,6 +300,18 @@ func (r *Router) updateRuleSetNeedFindProcess() {
 	defer r.ruleSetNeedFindProcessAccess.Unlock()
 	r.ruleSetNeedFindProcess.Store(slices.ContainsFunc(r.ruleSets, func(ruleSet adapter.RuleSet) bool {
 		return ruleSet.Metadata().ContainsProcessRule
+	}))
+	r.dnsFindProcess.Store(hasDNSRule(r.dnsRules, func(rule option.DefaultDNSRule) bool {
+		if isProcessDNSRule(rule) {
+			return true
+		}
+		for _, tag := range rule.RuleSet {
+			ruleSet, loaded := r.ruleSetMap[tag]
+			if loaded && ruleSet.Metadata().ContainsProcessRule {
+				return true
+			}
+		}
+		return false
 	}))
 }
 
