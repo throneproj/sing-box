@@ -34,6 +34,8 @@
   "auth_retry": "none",
   "static_challenge": "",
   "static_challenge_echo": false,
+  "auth_nocache": false,
+  "query_credentials": false,
   "static_key": [],
   "static_key_path": "",
   "key_direction": "",
@@ -231,6 +233,16 @@ OpenVPN 用户名/密码认证的密码。
 ### static_challenge_echo
 
 以明文显示静态质询响应。
+
+### auth_nocache
+
+发送用户名/密码后立即丢弃，因此每次连接尝试和重新协商都会重新请求，除非服务器推送了 `auth-token`。
+
+### query_credentials
+
+通过认证质询请求用户名和密码，而不是使用 `username` 和 `password`。
+
+`username` 会预填到质询中。设置 `static_challenge` 时忽略。
 
 ### static_key
 

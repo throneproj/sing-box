@@ -314,6 +314,8 @@ func (c *ClientEndpoint) buildClientOptions(options option.OpenVPNClientEndpoint
 			AuthRetry:           options.AuthRetry,
 			StaticChallenge:     options.StaticChallenge,
 			StaticChallengeEcho: options.StaticChallengeEcho,
+			NoCache:             options.AuthNoCache,
+			QueryCredentials:    options.QueryCredentials,
 		},
 		Pull: ovpn.ClientPullOptions{
 			Enabled:     true,
@@ -332,7 +334,7 @@ func (c *ClientEndpoint) buildStaticKeyClientOptions(options option.OpenVPNClien
 	if options.TLS != nil {
 		return ovpn.ClientOptions{}, E.New("`tls` options are not supported in `static_key` mode")
 	}
-	if options.Username != "" || options.Password != "" || (options.AuthRetry != "" && options.AuthRetry != "none") || options.StaticChallenge != "" || options.StaticChallengeEcho {
+	if options.Username != "" || options.Password != "" || (options.AuthRetry != "" && options.AuthRetry != "none") || options.StaticChallenge != "" || options.StaticChallengeEcho || options.AuthNoCache || options.QueryCredentials {
 		return ovpn.ClientOptions{}, E.New("username/password authentication is not supported in `static_key` mode")
 	}
 	if options.RouteNoPull || len(options.PullFilters) > 0 {

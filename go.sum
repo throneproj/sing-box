@@ -338,8 +338,6 @@ github.com/sagernet/sing-mux v0.3.10-0.20261110064256-375087483ea2 h1:bGC7//2xTN
 github.com/sagernet/sing-mux v0.3.10-0.20261110064256-375087483ea2/go.mod h1:jricpwCOndDsTEM1TM3piJvhL/2Mm7OhLkm+JadJJ1Q=
 github.com/sagernet/sing-openconnect v0.1.1-0.20261119021124-31db24231feb h1:gAt6mkxVJW9pgE9kNk/IvJRCLccDWQ1rTuZPSxnex4s=
 github.com/sagernet/sing-openconnect v0.1.1-0.20261119021124-31db24231feb/go.mod h1:4AKZLVcvY3r54UaK2Gbnm7aN8pOwdLz+y4EP0QFZ5Eg=
-github.com/sagernet/sing-openvpn v0.1.1-0.20261110111939-ad7a6ce7d11b h1:q4s4t1q+vNFSN4usnpfftPgHbEEs0paOMNxC7W8Ur0A=
-github.com/sagernet/sing-openvpn v0.1.1-0.20261110111939-ad7a6ce7d11b/go.mod h1:PWX7WygD8jpwfqfaGNySXpJYTn0SOwjBI1BKHHC2+Bw=
 github.com/sagernet/sing-quic v0.7.2-0.20261124143824-14ca3448d44b h1:I7h8MDkYIMofFW+BojM/2pNEBVWO1yiapP9keC9Uu9Y=
 github.com/sagernet/sing-quic v0.7.2-0.20261124143824-14ca3448d44b/go.mod h1:AOO1skHj0z1Iwz58ozMfJNY7p5dVg9O/HiSyWKTyrwY=
 github.com/sagernet/sing-shadowsocks v0.2.9-0.20260929204512-65740e0f0e3e h1:LKgE/uuqp/D2kgxYViOz8vf4slaCUfpFywXjtuwD5gU=
@@ -389,6 +387,8 @@ github.com/tc-hib/winres v0.2.1 h1:YDE0FiP0VmtRaDn7+aaChp1KiF4owBiJa5l964l5ujA=
 github.com/tc-hib/winres v0.2.1/go.mod h1:C/JaNhH3KBvhNKVbvdlDWkbMDO9H4fKKDaN7/07SSuk=
 github.com/throneproj/sing v0.9.4-0.20261124191429-42da4537a24e h1:1IfbBQdIqtsss5jFju9Lnrn+T8KaahkPd/BzJbDScLc=
 github.com/throneproj/sing v0.9.4-0.20261124191429-42da4537a24e/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
+github.com/throneproj/sing-openvpn v0.1.1-0.20261124193421-24edd96c0581 h1:g8k7ftZrw0i/Oo/HzunoPjeYRVpfmey/6m1iAkUsmBU=
+github.com/throneproj/sing-openvpn v0.1.1-0.20261124193421-24edd96c0581/go.mod h1:PWX7WygD8jpwfqfaGNySXpJYTn0SOwjBI1BKHHC2+Bw=
 github.com/throneproj/wireguard-go v0.0.0-20261112143559-827ce83a4eed h1:kiBqon1s689TBSghRQ/SDSJgdkPxAcffMYe8JgpCn+o=
 github.com/throneproj/wireguard-go v0.0.0-20261112143559-827ce83a4eed/go.mod h1:er10sELpmzLXq7S7Pbc1Zsbyapcr+/gxNAHKTo6fzVA=
 github.com/tidwall/gjson v1.14.2/go.mod h1:/wbyibRr2FHMks5tjHJ5F8dMZh3AcwJEMf5vlfC0lxk=

@@ -33,6 +33,8 @@ type OpenVPNClientEndpointOptions struct {
 	AuthRetry            string                           `json:"auth_retry,omitempty" enum:"none,nointeract,interact"`
 	StaticChallenge      string                           `json:"static_challenge,omitempty"`
 	StaticChallengeEcho  bool                             `json:"static_challenge_echo,omitempty"`
+	AuthNoCache          bool                             `json:"auth_nocache,omitempty"`
+	QueryCredentials     bool                             `json:"query_credentials,omitempty"`
 	StaticKey            badoption.Listable[string]       `json:"static_key,omitempty"`
 	StaticKeyPath        string                           `json:"static_key_path,omitempty"`
 	KeyDirection         string                           `json:"key_direction,omitempty" enum:"server,client"`
