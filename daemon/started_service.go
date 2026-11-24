@@ -7,6 +7,7 @@ import (
 	"runtime"
 	runtimeDebug "runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -67,6 +68,8 @@ type StartedService struct {
 	logLines                logRing
 	logSubscriber           *observable.Subscriber[*log.Entry]
 	logObserver             *observable.Observer[*log.Entry]
+	logStreams              atomic.Int32
+	attachedLogFactory      log.Factory
 	instance                *Instance
 	startedAt               time.Time
 	urlTestSubscriber       *observable.Subscriber[struct{}]
@@ -385,6 +388,8 @@ func (s *StartedService) SubscribeServiceStatus(empty *emptypb.Empty, server grp
 }
 
 func (s *StartedService) SubscribeLog(empty *emptypb.Empty, server grpc.ServerStreamingServer[Log]) error {
+	s.logStreams.Add(1)
+	defer s.logStreams.Add(-1)
 	s.logAccess.Lock()
 	savedLines := s.logLines.array()
 	subscription, done, err := s.logObserver.Subscribe()
