@@ -141,8 +141,8 @@ func (m *Manager) outboundCounters(outbound string, upload *atomic.Int64, downlo
 	if outbound == "" {
 		return []*atomic.Int64{upload}, []*atomic.Int64{download}
 	}
-	uploadCounter, _ := m.uploadMap.LoadOrStore(outbound, new(atomic.Int64))
-	downloadCounter, _ := m.downloadMap.LoadOrStore(outbound, new(atomic.Int64))
+	uploadCounter := loadCounter(&m.uploadMap, outbound)
+	downloadCounter := loadCounter(&m.downloadMap, outbound)
 	return []*atomic.Int64{upload, uploadCounter}, []*atomic.Int64{download, downloadCounter}
 }
 
@@ -150,16 +150,23 @@ func (m *Manager) pushUploaded(outbound string, size int64) {
 	if outbound == "" {
 		return
 	}
-	counter, _ := m.uploadMap.LoadOrStore(outbound, new(atomic.Int64))
-	counter.Add(size)
+	loadCounter(&m.uploadMap, outbound).Add(size)
 }
 
 func (m *Manager) pushDownloaded(outbound string, size int64) {
 	if outbound == "" {
 		return
 	}
-	counter, _ := m.downloadMap.LoadOrStore(outbound, new(atomic.Int64))
-	counter.Add(size)
+	loadCounter(&m.downloadMap, outbound).Add(size)
+}
+
+// loadCounter allocates only for an outbound it has not seen yet: flows count through here once per packet.
+func loadCounter(counters *compatible.Map[string, *atomic.Int64], outbound string) *atomic.Int64 {
+	if counter, loaded := counters.Load(outbound); loaded {
+		return counter
+	}
+	counter, _ := counters.LoadOrStore(outbound, new(atomic.Int64))
+	return counter
 }
 
 // TotalOutbound reports the traffic accounted to an outbound since the last

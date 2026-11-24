@@ -745,6 +745,7 @@ func (s *AutoSelector) pinnedFor(network string, byTag map[string]*rankedNode) a
 func (s *AutoSelector) loop() {
 	// Probe the active set straight away so the first pick is informed rather
 	// than inherited from the ranking prior.
+	lastRound := time.Now()
 	s.runRound(true)
 
 	ticker := time.NewTicker(s.interval)
@@ -767,6 +768,14 @@ func (s *AutoSelector) loop() {
 			// The recovery goroutine owns probing while suspended.
 			continue
 		}
+		now := time.Now()
+		if !urgent && !sleepDue(lastRound, now, s.interval, s.interval*sleepRoundStretch) {
+			s.access.Lock()
+			s.nextRoundAt = now.Add(s.interval)
+			s.access.Unlock()
+			continue
+		}
+		lastRound = now
 		s.runRound(urgent)
 		s.access.Lock()
 		s.nextRoundAt = time.Now().Add(s.interval)
@@ -825,6 +834,8 @@ func (s *AutoSelector) watchLoop() {
 	defer ticker.Stop()
 	pauseCallback := pause.RegisterTicker(s.pause, ticker, s.watchInterval, nil)
 	defer s.pause.UnregisterCallback(pauseCallback)
+	sleepInterval := max(sleepWatchInterval, s.watchInterval)
+	var lastWatch time.Time
 	for {
 		select {
 		case <-s.close:
@@ -834,6 +845,11 @@ func (s *AutoSelector) watchLoop() {
 		if s.isSuspended() {
 			continue
 		}
+		now := time.Now()
+		if !sleepDue(lastWatch, now, s.watchInterval, sleepInterval) {
+			continue
+		}
+		lastWatch = now
 		// Real traffic answering since the last tick already says what the probe would.
 		if detour := s.selectedFor(N.NetworkTCP); detour != nil && !s.serving(detour.Tag()) {
 			s.watchSelected(detour)
@@ -1325,6 +1341,7 @@ func (s *AutoSelector) recoveryLoop() {
 	var (
 		lastAttempt    time.Time
 		lastOptimistic time.Time
+		lastIteration  time.Time
 		lastIndex      = -1
 	)
 	for {
@@ -1336,6 +1353,11 @@ func (s *AutoSelector) recoveryLoop() {
 		if !s.isSuspended() {
 			return
 		}
+		now := time.Now()
+		if !sleepDue(lastIteration, now, recoveryInterval, sleepRecoveryInterval) {
+			continue
+		}
+		lastIteration = now
 		index := s.defaultInterfaceIndex()
 		if index < 0 {
 			backoff = recoveryInterval
@@ -1348,7 +1370,6 @@ func (s *AutoSelector) recoveryLoop() {
 			lastAttempt = time.Time{}
 		}
 
-		now := time.Now()
 		ready := index >= 0
 		if ready && s.suspendedFor(now) < osResumeGrace {
 			ready = (s.connectURL == "" || s.connectivityOK(true)) && s.upstreamOK(true)
