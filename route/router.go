@@ -175,9 +175,6 @@ func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 				needFindProcess = true
 			}
 		}
-		if C.IsAndroid && r.platformInterface != nil {
-			needFindProcess = true
-		}
 		r.needFindProcess = needFindProcess
 		if needFindProcess {
 			if r.platformInterface != nil && r.platformInterface.UsePlatformConnectionOwnerFinder() {
