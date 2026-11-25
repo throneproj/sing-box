@@ -18,7 +18,9 @@ import (
 )
 
 func (r *Router) hijackDNSStream(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
-	r.searchProcessInfo(ctx, &metadata)
+	if r.dnsFindProcess {
+		r.searchProcessInfo(ctx, &metadata)
+	}
 	metadata.Destination = M.Socksaddr{}
 	err := N.ReportConnHandshakeSuccess(conn, conn)
 	if err != nil {
@@ -38,7 +40,9 @@ func (r *Router) hijackDNSStream(ctx context.Context, conn net.Conn, metadata ad
 }
 
 func (r *Router) hijackDNSPacket(ctx context.Context, conn N.PacketConn, packetBuffers []*N.PacketBuffer, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
-	r.searchProcessInfo(ctx, &metadata)
+	if r.dnsFindProcess {
+		r.searchProcessInfo(ctx, &metadata)
+	}
 	err := N.ReportPacketConnHandshakeSuccess(conn, nil)
 	if err != nil {
 		N.ReleaseMultiPacketBuffer(packetBuffers)
@@ -60,12 +64,23 @@ func (r *Router) HijackDNSPacket(ctx context.Context, payload []byte, writer N.P
 		r.logger.ErrorContext(ctx, E.Cause(err, "process DNS packet: unpack request"))
 		return
 	}
-	r.searchProcessInfo(ctx, &metadata)
+	if r.dnsFindProcess {
+		// The caller is the inbound's packet loop, which must not wait for an owner lookup.
+		go func() {
+			r.searchProcessInfo(ctx, &metadata)
+			r.exchangeDNSPacket(ctx, &message, writer, metadata)
+		}()
+		return
+	}
+	r.exchangeDNSPacket(ctx, &message, writer, metadata)
+}
+
+func (r *Router) exchangeDNSPacket(ctx context.Context, message *mDNS.Msg, writer N.PacketWriter, metadata adapter.InboundContext) {
 	destination := metadata.Destination
 	metadata.Destination = M.Socksaddr{}
-	r.dns.ExchangeAsync(adapter.WithContext(ctx, &metadata), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, exchangeErr error) {
+	r.dns.ExchangeAsync(adapter.WithContext(ctx, &metadata), message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, exchangeErr error) {
 		if exchangeErr == nil {
-			exchangeErr = r.writeDNSPacketResponse(&message, response, writer, destination)
+			exchangeErr = r.writeDNSPacketResponse(message, response, writer, destination)
 		}
 		if exchangeErr != nil && !R.IsRejected(exchangeErr) && !E.IsClosedOrCanceled(exchangeErr) {
 			r.logger.ErrorContext(ctx, E.Cause(exchangeErr, "process DNS packet"))

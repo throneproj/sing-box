@@ -36,7 +36,9 @@ type Router struct {
 	network           adapter.NetworkManager
 	httpClientManager adapter.HTTPClientManager
 	rules             []adapter.Rule
+	dnsRules          []option.DNSRule
 	needFindProcess   bool
+	dnsFindProcess    bool
 	needFindNeighbor  bool
 	leaseFiles        []string
 	ruleSets          []adapter.RuleSet
@@ -62,6 +64,7 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.Route
 		network:           service.FromContext[adapter.NetworkManager](ctx),
 		httpClientManager: service.FromContext[adapter.HTTPClientManager](ctx),
 		rules:             make([]adapter.Rule, 0, len(options.Rules)),
+		dnsRules:          dnsOptions.Rules,
 		ruleSetMap:        make(map[string]adapter.RuleSet),
 		needFindProcess:   hasRule(options.Rules, isProcessRule) || hasDNSRule(dnsOptions.Rules, isProcessDNSRule) || options.FindProcess,
 		needFindNeighbor:  hasRule(options.Rules, isNeighborRule) || hasDNSRule(dnsOptions.Rules, isNeighborDNSRule) || hasLocalNeighborDNSServer(dnsOptions.Servers) || options.FindNeighbor,
@@ -214,6 +217,18 @@ func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			}
 			processCache.SetLifetime(cacheLifetime)
 			r.processCache = processCache
+			r.dnsFindProcess = hasDNSRule(r.dnsRules, func(rule option.DefaultDNSRule) bool {
+				if isProcessDNSRule(rule) {
+					return true
+				}
+				for _, tag := range rule.RuleSet {
+					ruleSet, loaded := r.ruleSetMap[tag]
+					if loaded && ruleSet.Metadata().ContainsProcessRule {
+						return true
+					}
+				}
+				return false
+			})
 		}
 		for i, rule := range r.rules {
 			scope.Add(rule.Close)

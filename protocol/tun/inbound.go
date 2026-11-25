@@ -641,7 +641,7 @@ func (t *Inbound) NewDNSPacket(payload []byte, source M.Socksaddr, destination M
 	metadata.Source = source
 	metadata.Destination = destination
 	metadata.Protocol = C.ProtocolDNS
-	t.logger.InfoContext(ctx, "inbound DNS packet from ", source)
+	t.logger.DebugContext(ctx, "inbound DNS packet from ", source)
 	t.router.HijackDNSPacket(ctx, payload, writer, metadata)
 }
 

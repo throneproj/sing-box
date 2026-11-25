@@ -2,12 +2,17 @@ package process
 
 import (
 	"context"
+	"errors"
 	"net/netip"
 	"syscall"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/winiphlpapi"
+	"github.com/sagernet/sing/contrab/freelru"
+	"github.com/sagernet/sing/contrab/maphash"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
@@ -15,14 +20,27 @@ import (
 
 var _ Searcher = (*windowsSearcher)(nil)
 
-type windowsSearcher struct{}
+// A cached path goes stale only when its PID is reused or its service is reconfigured; the lifetime bounds both.
+const pathCacheLifetime = 4 * time.Second
+
+type windowsSearcher struct {
+	processPathCache *freelru.Cache[uint32, string]
+	servicePathCache *freelru.Cache[string, string]
+}
 
 func NewSearcher(_ Config) (Searcher, error) {
 	err := initWin32API()
 	if err != nil {
 		return nil, E.Cause(err, "init win32 api")
 	}
-	return &windowsSearcher{}, nil
+	processPathCache := common.Must1(freelru.New[uint32, string](512, maphash.NewHasher[uint32]().Hash32, true))
+	processPathCache.SetLifetime(pathCacheLifetime)
+	servicePathCache := common.Must1(freelru.New[string, string](64, maphash.NewHasher[string]().Hash32, true))
+	servicePathCache.SetLifetime(pathCacheLifetime)
+	return &windowsSearcher{
+		processPathCache: processPathCache,
+		servicePathCache: servicePathCache,
+	}, nil
 }
 
 func initWin32API() error {
@@ -30,6 +48,8 @@ func initWin32API() error {
 }
 
 func (s *windowsSearcher) ResetCache() {
+	s.processPathCache.Purge()
+	s.servicePathCache.Purge()
 }
 
 func (s *windowsSearcher) Close() error {
@@ -41,18 +61,45 @@ func (s *windowsSearcher) FindProcessInfo(ctx context.Context, network string, s
 	if err != nil {
 		return nil, err
 	}
-	path, err := getProcessPath(owner.Pid)
+	path, err := s.findProcessPath(owner.Pid)
 	if err != nil {
 		return &adapter.ConnectionOwner{ProcessID: owner.Pid, UserId: -1}, err
 	}
 	processPaths := []string{path}
 	if owner.ServiceName != "" {
-		servicePath, serviceErr := getServiceDLLPath(owner.ServiceName)
-		if serviceErr == nil {
+		servicePath := s.findServiceDLLPath(owner.ServiceName)
+		if servicePath != "" {
 			processPaths = []string{servicePath, path}
 		}
 	}
 	return &adapter.ConnectionOwner{ProcessID: owner.Pid, ProcessPaths: processPaths, UserId: -1}, nil
+}
+
+func (s *windowsSearcher) findProcessPath(pid uint32) (string, error) {
+	path, loaded := s.processPathCache.Get(pid)
+	if loaded {
+		return path, nil
+	}
+	path, err := getProcessPath(pid)
+	if err != nil {
+		return "", err
+	}
+	s.processPathCache.Add(pid, path)
+	return path, nil
+}
+
+func (s *windowsSearcher) findServiceDLLPath(serviceName string) string {
+	servicePath, loaded := s.servicePathCache.Get(serviceName)
+	if loaded {
+		return servicePath
+	}
+	// A service running in its own process has no ServiceDll, so the miss is cached too.
+	servicePath, err := getServiceDLLPath(serviceName)
+	if err != nil {
+		servicePath = ""
+	}
+	s.servicePathCache.Add(serviceName, servicePath)
+	return servicePath
 }
 
 func getServiceDLLPath(serviceName string) (string, error) {
@@ -90,11 +137,18 @@ func getProcessPath(pid uint32) (string, error) {
 		return "", err
 	}
 	defer windows.CloseHandle(handle)
-	size := uint32(syscall.MAX_LONG_PATH)
-	buf := make([]uint16, syscall.MAX_LONG_PATH)
-	err = windows.QueryFullProcessImageName(handle, 0, &buf[0], &size)
-	if err != nil {
-		return "", err
+	// Grow only on demand: a constant-length MAX_LONG_PATH buffer is 64 KiB on the caller's goroutine stack.
+	bufferLength := uint32(syscall.MAX_PATH)
+	for {
+		buf := make([]uint16, bufferLength)
+		size := bufferLength
+		err = windows.QueryFullProcessImageName(handle, 0, &buf[0], &size)
+		if err == nil {
+			return windows.UTF16ToString(buf[:size]), nil
+		}
+		if !errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) || bufferLength == syscall.MAX_LONG_PATH {
+			return "", err
+		}
+		bufferLength = syscall.MAX_LONG_PATH
 	}
-	return windows.UTF16ToString(buf[:size]), nil
 }
