@@ -33,14 +33,36 @@ type http2Conn struct {
 	closeOnce  sync.Once
 }
 
-func DialHTTP2(ctx context.Context, lifetime context.Context, dialer N.Dialer, destination M.Socksaddr, tlsConfig tls.Config, h2Transport *http2.Transport) (Conn, error) {
-	tlsConn, err := dialTLS(ctx, dialer, destination, tlsConfig)
+// HTTP2Handshake is a TLS connection past its handshake that carries no tunnel yet.
+type HTTP2Handshake struct {
+	tlsConn tls.Conn
+}
+
+func HandshakeHTTP2(ctx context.Context, dialer N.Dialer, destination M.Socksaddr, tlsConfig tls.Config) (*HTTP2Handshake, error) {
+	tlsConfig = tlsConfig.Clone()
+	tlsConfig.SetNextProtos([]string{http2.NextProtoTLS})
+	tcpConn, err := dialer.DialContext(ctx, N.NetworkTCP, destination)
 	if err != nil {
 		return nil, err
 	}
-	clientConn, err := h2Transport.NewClientConn(tlsConn)
+	tlsConn, err := tls.ClientHandshake(ctx, tcpConn, tlsConfig)
 	if err != nil {
+		tcpConn.Close()
+		return nil, err
+	}
+	// Cloudflare's MASQUE edge completes TLS without selecting any ALPN protocol.
+	if protocol := tlsConn.ConnectionState().NegotiatedProtocol; protocol != "" && protocol != http2.NextProtoTLS {
 		tlsConn.Close()
+		return nil, E.New("server negotiated ", protocol, " instead of HTTP/2")
+	}
+	return &HTTP2Handshake{tlsConn: tlsConn}, nil
+}
+
+// Open sends the CONNECT request and consumes the handshake, closing it on failure; the tunnel ends with lifetime.
+func (h *HTTP2Handshake) Open(ctx context.Context, lifetime context.Context, h2Transport *http2.Transport) (Conn, error) {
+	clientConn, err := h2Transport.NewClientConn(h.tlsConn)
+	if err != nil {
+		h.tlsConn.Close()
 		return nil, err
 	}
 	pipeReader, pipeWriter := io.Pipe()
@@ -48,7 +70,7 @@ func DialHTTP2(ctx context.Context, lifetime context.Context, dialer N.Dialer, d
 	streamCtx, cancel, dialed := newStreamContext(lifetime, ctx)
 	conn := &http2Conn{
 		ctx:        streamCtx,
-		tlsConn:    tlsConn,
+		tlsConn:    h.tlsConn,
 		clientConn: clientConn,
 		cancel:     cancel,
 		pipeWriter: pipeWriter,
@@ -69,6 +91,7 @@ func DialHTTP2(ctx context.Context, lifetime context.Context, dialer N.Dialer, d
 	response, err := clientConn.RoundTrip(request.WithContext(streamCtx))
 	dialed()
 	if err != nil {
+		err = conn.readError(err)
 		conn.closeWithError(err)
 		return nil, err
 	}
@@ -82,34 +105,8 @@ func DialHTTP2(ctx context.Context, lifetime context.Context, dialer N.Dialer, d
 	return conn, nil
 }
 
-// HandshakeHTTP2 runs only the TCP and TLS handshakes DialHTTP2 starts with, then closes.
-func HandshakeHTTP2(ctx context.Context, dialer N.Dialer, destination M.Socksaddr, tlsConfig tls.Config) error {
-	tlsConn, err := dialTLS(ctx, dialer, destination, tlsConfig)
-	if err != nil {
-		return err
-	}
-	tlsConn.Close()
-	return nil
-}
-
-func dialTLS(ctx context.Context, dialer N.Dialer, destination M.Socksaddr, tlsConfig tls.Config) (tls.Conn, error) {
-	tlsConfig = tlsConfig.Clone()
-	tlsConfig.SetNextProtos([]string{http2.NextProtoTLS})
-	tcpConn, err := dialer.DialContext(ctx, N.NetworkTCP, destination)
-	if err != nil {
-		return nil, err
-	}
-	tlsConn, err := tls.ClientHandshake(ctx, tcpConn, tlsConfig)
-	if err != nil {
-		tcpConn.Close()
-		return nil, err
-	}
-	// Cloudflare's MASQUE edge completes TLS without selecting any ALPN protocol.
-	if protocol := tlsConn.ConnectionState().NegotiatedProtocol; protocol != "" && protocol != http2.NextProtoTLS {
-		tlsConn.Close()
-		return nil, E.New("server negotiated ", protocol, " instead of HTTP/2")
-	}
-	return tlsConn, nil
+func (h *HTTP2Handshake) Close() error {
+	return h.tlsConn.Close()
 }
 
 func (c *http2Conn) ReadPacket(buffer *buf.Buffer) error {

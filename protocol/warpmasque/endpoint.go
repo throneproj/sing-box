@@ -73,7 +73,7 @@ type Endpoint struct {
 	quicConfig      *quic.Config
 	h2Transport     *http2.Transport
 	versionFallback bool
-	preferHTTP2     bool
+	http2Only       bool
 	localAddresses  []netip.Prefix
 	mtu             uint32
 	system          bool
@@ -179,7 +179,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		quicConfig:      quicConfig,
 		h2Transport:     h2Transport,
 		versionFallback: useHTTP3 && useHTTP2,
-		preferHTTP2:     !useHTTP3,
+		http2Only:       !useHTTP3,
 		localAddresses:  options.Address,
 		mtu:             mtu,
 		system:          options.System,

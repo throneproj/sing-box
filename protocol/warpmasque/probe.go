@@ -110,10 +110,11 @@ func probeCarrier(ctx context.Context, options option.WARPMASQUEEndpointOptions,
 			tcpDialer.SetMultipathTCP(true)
 		}
 		start := time.Now()
-		err = masquetransport.HandshakeHTTP2(ctx, &probeTCPDialer{tcpDialer}, destination, tlsConfig)
+		handshake, err := masquetransport.HandshakeHTTP2(ctx, &probeTCPDialer{tcpDialer}, destination, tlsConfig)
 		if err != nil {
 			return 0, err
 		}
+		handshake.Close()
 		return time.Since(start), nil
 	}
 	tlsConfig, err := tls.NewSTDClient(ctx, logger.NOP(), options.Server, tlsOptions)
@@ -142,10 +143,11 @@ func probeCarrier(ctx context.Context, options option.WARPMASQUEEndpointOptions,
 		}
 	}
 	start := time.Now()
-	err = masquetransport.HandshakeHTTP3(ctx, packetConn, destination, stdConfig, newQUICConfig(options, tlsConfig.HandshakeTimeout()))
+	handshake, err := masquetransport.HandshakeHTTP3(ctx, packetConn, destination, stdConfig, newQUICConfig(options, tlsConfig.HandshakeTimeout()))
 	if err != nil {
 		return 0, err
 	}
+	handshake.Close()
 	return time.Since(start), nil
 }
 
