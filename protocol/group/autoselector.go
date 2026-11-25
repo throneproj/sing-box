@@ -1118,6 +1118,9 @@ func timeRequest(ctx context.Context, client *http.Client, link string) (time.Du
 	// The transport reuses a connection only once its body was read to EOF.
 	_, _ = io.CopyN(io.Discard, response.Body, probeDrainLimit)
 	response.Body.Close()
+	if response.StatusCode >= http.StatusBadRequest {
+		return 0, E.New("unexpected status: ", response.Status)
+	}
 	return delay, nil
 }
 
@@ -1280,7 +1283,7 @@ func (s *AutoSelector) upstreamOK(force bool) bool {
 	}
 	ctx, cancel := context.WithTimeout(s.ctx, s.probeTimeout)
 	defer cancel()
-	_, err := urltest.URLTest(ctx, s.link, s.upstream)
+	_, err := warmURLTest(ctx, s.link, s.upstream)
 	s.upstreamAlive = err == nil
 	s.upstreamCheckedAt = time.Now()
 	return s.upstreamAlive
